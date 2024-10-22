@@ -1,0 +1,30 @@
+# macOS system files
+.DS_Store
+
+# Python related files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments and dependency management
+Pipfile.lock
+Pipfile
+
+# Selenium drivers
+/chromedriver-*/  # Exclude the entire folder for chromedriver binaries
+
+# IDE (e.g., PyCharm) related files
+.idea/
+*.iml
+
+# Zip files
+*.zip
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# OS generated files
+Thumbs.db
+/chromedriver-mac-arm64
