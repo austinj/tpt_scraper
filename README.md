@@ -12,6 +12,8 @@ This is a web scraper for [TeachersPayTeachers.com](https://www.teacherspayteach
 
 The collected data is then saved to a CSV file.
 
+This web scraper was created as part of a paid project for ecuational research under Lydia Beahm, a professor in the Department of Education and Human Development at Clemson University.
+
 ---
 
 ## Features
@@ -47,7 +49,7 @@ Before running the script, ensure you have the following installed:
 
 1. **Clone the repository**:
     ```bash
-    git clone https://github.com/yourusername/teachers4teachers-scraper.git
+    git clone https://github.com/adamruns/teachers4teachers-scraper.git
     cd teachers4teachers-scraper
     ```
 
@@ -112,33 +114,6 @@ You can modify the script to:
 
 ---
 
-## Contributing
-
-1. Fork the repository.
-2. Create a new feature branch:
-    ```bash
-    git checkout -b feature-name
-    ```
-3. Make your changes and commit them:
-    ```bash
-    git commit -m "Add some feature"
-    ```
-4. Push the branch:
-    ```bash
-    git push origin feature-name
-    ```
-5. Submit a pull request.
-
----
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## Acknowledgments
-
-- [TeachersPayTeachers](https://www.teacherspayteachers.com) for the data source.
-- [Selenium](https://www.selenium.dev/) for the browser automation tool.
-- [ChromeDriver](https://sites.google.com/a/chromium.org/chromedriver/) for providing the WebDriver.
