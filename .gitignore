@@ -28,3 +28,7 @@ Pipfile
 # OS generated files
 Thumbs.db
 /chromedriver-mac-arm64
+
+# CSVs
+info
+URL_List
