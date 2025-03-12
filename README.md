@@ -12,7 +12,7 @@ This is a web scraper for [TeachersPayTeachers.com](https://www.teacherspayteach
 
 The collected data is then saved to a CSV file.
 
-This web scraper was created as part of a paid project for ecuational research under Lydia Beahm, a professor in the Department of Education and Human Development at Clemson University.
+This web scraper was created as part of a paid project for educuational research under Lydia Beahm, a professor in the Department of Education and Human Development at Clemson University.
 
 ---
 
