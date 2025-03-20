@@ -11,9 +11,6 @@ __pycache__/
 Pipfile.lock
 Pipfile
 
-# Selenium drivers
-/chromedriver-*/  # Exclude the entire folder for chromedriver binaries
-
 # IDE (e.g., PyCharm) related files
 .idea/
 *.iml
@@ -30,9 +27,7 @@ Thumbs.db
 /chromedriver-mac-arm64
 
 # CSVs
-info
-URL_List
-
-venv
 output_url
 output_data
+
+venv
