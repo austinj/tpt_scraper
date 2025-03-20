@@ -28,5 +28,5 @@ def export_table_to_csv(table_name, output_file):
 
 if __name__ == "__main__":
     # Export both tables to CSV files
-    export_table_to_csv("extracted_urls", "extracted_urls.csv")
-    export_table_to_csv("product_data", "product_data.csv")
+    export_table_to_csv("extracted_urls", "output/extracted_urls.csv")
+    export_table_to_csv("product_data", "output/product_data.csv")
