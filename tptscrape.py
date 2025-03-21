@@ -5,6 +5,8 @@ import random
 import json
 import logging
 import aiosqlite
+import math
+import os
 from bs4 import BeautifulSoup
 
 # Configuration file name and SQLite database file
@@ -51,7 +53,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 async def setup_db():
     """Creates the SQLite database and tables if they don't exist."""
     async with aiosqlite.connect(DB_FILE) as db:
-        # Create extracted_urls table with configuration parameters
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS extracted_urls (
                 url TEXT PRIMARY KEY,
@@ -61,7 +65,32 @@ async def setup_db():
                 page INTEGER
             )
         """)
-        # Create product_data table with scraped product fields and configuration parameters.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_pages (
+                folder TEXT,
+                price_option TEXT,
+                sort_order TEXT,
+                page INTEGER,
+                PRIMARY KEY(folder, price_option, sort_order, page)
+            )
+        """)
+        # ← Add this extraction_progress table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extraction_progress (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                last_batch INTEGER
+            )
+        """)
+        await db.execute("""
+            CREATE VIEW IF NOT EXISTS unique_extracted_urls AS
+            SELECT url,
+                   MIN(folder) AS folder,
+                   MIN(price_option) AS price_option,
+                   MIN(sort_order) AS sort_order,
+                   MIN(page) AS page
+            FROM extracted_urls
+            GROUP BY url
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS product_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +108,8 @@ async def setup_db():
             )
         """)
         await db.commit()
+
+
 
 async def insert_extracted_urls(url_details):
     """
@@ -117,6 +148,14 @@ async def insert_product_data(data):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         await db.commit()
+
+async def get_unique_extracted_urls():
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT url, folder, price_option, sort_order, page FROM unique_extracted_urls"
+        ) as cursor:
+            return await cursor.fetchall()
+
 
 ###########################
 # URL Building and Fetch  #
@@ -176,37 +215,98 @@ async def extract_urls_from_page(session, page_url):
     return urls
 
 async def extract_page_wrapper(session, page_url, semaphore, results, folder, price_option, sort_order, page):
-    """Wrapper to control concurrency and update the results dict with configuration parameters."""
     async with semaphore:
         logging.info("Fetching page: %s", page_url)
         urls = await extract_urls_from_page(session, page_url)
+
         if urls:
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?)",
+                    (folder, price_option, sort_order, page),
+                )
+                await db.commit()
+
             for url in urls:
-                # Save the config parameters alongside the URL if not already present
                 if url not in results:
                     results[url] = (folder, price_option, sort_order, page)
+
         return urls
 
-async def extraction_stage():
-    """
-    Extraction stage:
-    Asynchronously fetch pages for every combination, deduplicate URLs (with parameters),
-    and store them in SQLite.
-    """
-    extracted_url_details = {}  # dict mapping url -> (folder, price_option, sort_order, page)
+
+
+async def extraction_stage(batch_size=100):
+
+    logging.info("Using SQLite database at %s", os.path.abspath(DB_FILE))
+
+    # 1️⃣ Generate every combination
+    combos = [
+        (folder, price, sort, page)
+        for folder in FOLDER_STRUCTURES
+        for price in PRICE_OPTIONS
+        for sort in SORTING_METHODS
+        for page in range(1, TOTAL_PAGES + 1)
+    ]
+
+    # 2️⃣ Load already‑done combos from the DB
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("""
+            SELECT folder, price_option, sort_order, page 
+            FROM extracted_pages
+        """) as cursor:
+            done_combos = set(await cursor.fetchall())
+
+    logging.info("Already done combos: %s/%s", len(done_combos), len(combos))
+
+    # 3️⃣ Filter out completed combos
+    remaining = [c for c in combos if c not in done_combos]
+    total_batches = math.ceil(len(remaining) / batch_size)
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-    tasks = []
+
     async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
-        for folder in FOLDER_STRUCTURES:
-            for price in PRICE_OPTIONS:
-                for sort_order in SORTING_METHODS:
-                    for page in range(1, TOTAL_PAGES + 1):
-                        page_url = build_page_url(folder, price, sort_order, page)
-                        tasks.append(extract_page_wrapper(session, page_url, semaphore, extracted_url_details, folder, price, sort_order, page))
-        await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Total unique URLs extracted: %s", len(extracted_url_details))
-    await insert_extracted_urls(extracted_url_details)
-    logging.info("Extracted URLs saved to SQLite database (%s).", DB_FILE)
+        for batch_idx in range(total_batches):
+            start, end = batch_idx * batch_size, (batch_idx + 1) * batch_size
+            batch = remaining[start:end]
+            batch_results = {}
+
+            tasks = [
+                extract_page_wrapper(session,
+                                     build_page_url(folder, price, sort, page),
+                                     semaphore,
+                                     batch_results,
+                                     folder, price, sort, page)
+                for folder, price, sort, page in batch
+            ]
+
+            # ─── STEP 3: ensure any INSERTs get committed even if cancelled ───
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.commit()
+
+            # ─── STEP 4: batch insert combos + record batch index ───
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?)",
+                    [(f, p, s, pg) for f, p, s, pg in batch if batch_results]
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO extraction_progress VALUES (1, ?)",
+                    (batch_idx,)
+                )
+                await db.commit()
+
+            await insert_extracted_urls(batch_results)
+
+            logging.info(
+                "Batch %s/%s complete — extracted %s URLs",
+                batch_idx + 1, total_batches, len(batch_results)
+            )
+            await asyncio.sleep(random.uniform(2, 5))
+
+    logging.info("Resumed extraction finished; all new pages saved.")
+
 
 async def extraction_test(test_limit=5):
     """
@@ -262,36 +362,29 @@ async def scrape_product_data(session, url):
     return title, short_description, long_description, rating_value, number_of_ratings, product_price, url
 
 async def processing_stage(batch_size=50):
-    """
-    Processing stage:
-    Reads URLs with their configuration parameters from SQLite, scrapes product data concurrently,
-    and stores the results (combined with the config parameters) in the database.
-    """
-    # Retrieve rows as tuples: (url, folder, price_option, sort_order, page)
-    url_records = await get_extracted_urls()
+    url_records = await get_unique_extracted_urls()
     total_records = len(url_records)
-    logging.info("Total URLs to process: %s", total_records)
+    logging.info("Total unique URLs to process: %s", total_records)
+
     async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
-        # Process in batches
         for i in range(0, total_records, batch_size):
             batch = url_records[i:i+batch_size]
-            tasks = []
-            # Each record contains: (url, folder, price_option, sort_order, page)
-            for record in batch:
-                url, folder, price_option, sort_order, page = record
-                tasks.append(scrape_product_data(session, url))
+            tasks = [scrape_product_data(session, record[0]) for record in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for j, result in enumerate(results):
                 if result and not isinstance(result, Exception):
-                    # Retrieve the config parameters for this URL from the batch
                     url, folder, price_option, sort_order, page = batch[j]
-                    # Combine scraped data with config parameters.
-                    # result is a tuple: (title, short_description, long_description, rating_value, number_of_ratings, product_price, url)
-                    full_data = result + (folder, price_option, sort_order, page)
+                    full_data = (*result, folder, price_option, sort_order, page)
                     await insert_product_data(full_data)
-            logging.info("Processed batch %s (%s to %s)", (i // batch_size) + 1, i+1, min(i+batch_size, total_records))
-            await asyncio.sleep(random.uniform(5.0, 10.0))  # Throttle between batches
-    logging.info("Product data stored in SQLite database (%s).", DB_FILE)
+            logging.info(
+                "Processed batch %s (%s to %s)",
+                (i // batch_size) + 1,
+                i + 1,
+                min(i + batch_size, total_records),
+            )
+            await asyncio.sleep(random.uniform(5, 10))
+    logging.info("Finished processing unique URLs.")
+
 
 ###########################
 # Main Entry Point        #
