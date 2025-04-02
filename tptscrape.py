@@ -7,34 +7,36 @@ import logging
 import aiosqlite
 import math
 import os
+import argparse
+from pathlib import Path
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from tqdm.asyncio import tqdm_asyncio
 
-# Configuration file name and SQLite database file
 CONFIG_FILE = "config.json"
 DB_FILE = "scrape_cache.db"
 
+# Load configuration
+
 def load_config(config_file=CONFIG_FILE):
-    """Loads configuration from an external JSON file."""
     try:
         with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        return config
+            return json.load(f)
     except Exception as e:
         logging.error("Error loading config: %s", e)
-        # Provide defaults if file not found or on error
         return {
-            "folder_structures": [
-                "teacher-tools/classroom-management",
-                "teacher-tools/subject-math"
-            ],
+            "folder_structures": ["teacher-tools/classroom-management", "teacher-tools/subject-math"],
             "price_options": ["", "on-sale"],
             "sorting_methods": ["Relevance", "Rating", "Price-Low-to-High", "Newest"],
             "total_pages": 42,
             "concurrent_requests": 10,
-            "max_retries": 3
+            "max_retries": 3,
+            "sleep_between_batches": [2, 5],
+            "download_sleep": [5, 10],
+            "retry_backoff_start": 1,
+            "retry_backoff_factor": 2
         }
 
-# Load external configuration
 config = load_config()
 FOLDER_STRUCTURES = config.get("folder_structures", [])
 PRICE_OPTIONS = config.get("price_options", [])
@@ -42,8 +44,11 @@ SORTING_METHODS = config.get("sorting_methods", [])
 TOTAL_PAGES = config.get("total_pages", 42)
 CONCURRENT_REQUESTS = config.get("concurrent_requests", 10)
 MAX_RETRIES = config.get("max_retries", 3)
+SLEEP_BETWEEN_BATCHES = config.get("sleep_between_batches", [2, 5])
+DOWNLOAD_SLEEP = config.get("download_sleep", [5, 10])
+RETRY_BACKOFF_START = config.get("retry_backoff_start", 1)
+RETRY_BACKOFF_FACTOR = config.get("retry_backoff_factor", 2)
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 ###########################
@@ -74,7 +79,7 @@ async def setup_db():
                 PRIMARY KEY(folder, price_option, sort_order, page)
             )
         """)
-        # ← Add this extraction_progress table
+        # Extraction progress table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS extraction_progress (
                 id INTEGER PRIMARY KEY CHECK(id=1),
@@ -91,6 +96,7 @@ async def setup_db():
             FROM extracted_urls
             GROUP BY url
         """)
+        # Updated product_data table with configuration metadata.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS product_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,48 +110,24 @@ async def setup_db():
                 folder TEXT,
                 price_option TEXT,
                 sort_order TEXT,
-                page INTEGER
+                page INTEGER,
+                config_metadata TEXT
             )
         """)
         await db.commit()
-
-
-
-async def insert_extracted_urls(url_details):
-    """
-    Insert extracted URLs along with their configuration parameters.
-    `url_details` should be a dict mapping url -> (folder, price_option, sort_order, page)
-    """
-    async with aiosqlite.connect(DB_FILE) as db:
-        for url, params in url_details.items():
-            folder, price_option, sort_order, page = params
-            await db.execute("""
-                INSERT OR IGNORE INTO extracted_urls (url, folder, price_option, sort_order, page)
-                VALUES (?, ?, ?, ?, ?)
-            """, (url, folder, price_option, sort_order, page))
-        await db.commit()
-
-async def get_extracted_urls():
-    """
-    Retrieve all URLs with their configuration parameters.
-    Returns a list of tuples: (url, folder, price_option, sort_order, page)
-    """
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT url, folder, price_option, sort_order, page FROM extracted_urls") as cursor:
-            rows = await cursor.fetchall()
-    return rows
 
 async def insert_product_data(data):
     """
     Insert product data along with configuration parameters.
     Data should be a tuple in the form:
-    (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page)
+    (title, short_description, long_description, rating_value, number_of_ratings,
+     product_price, url, folder, price_option, sort_order, page, config_metadata)
     """
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             INSERT OR IGNORE INTO product_data 
-            (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page, config_metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         await db.commit()
 
@@ -155,7 +137,6 @@ async def get_unique_extracted_urls():
             "SELECT url, folder, price_option, sort_order, page FROM unique_extracted_urls"
         ) as cursor:
             return await cursor.fetchall()
-
 
 ###########################
 # URL Building and Fetch  #
@@ -214,29 +195,26 @@ async def extract_urls_from_page(session, page_url):
             urls.append(full_url)
     return urls
 
-async def extract_page_wrapper(session, page_url, semaphore, results, folder, price_option, sort_order, page):
+async def extract_page_wrapper(session, page_url, semaphore, folder, price_option, sort_order, page):
     async with semaphore:
         logging.info("Fetching page: %s", page_url)
         urls = await extract_urls_from_page(session, page_url)
-
         if urls:
             async with aiosqlite.connect(DB_FILE) as db:
+                # Immediately mark the page as processed and insert URLs
                 await db.execute(
                     "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?)",
                     (folder, price_option, sort_order, page),
                 )
+                for url in urls:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO extracted_urls (url, folder, price_option, sort_order, page) VALUES (?, ?, ?, ?, ?)",
+                        (url, folder, price_option, sort_order, page)
+                    )
                 await db.commit()
-
-            for url in urls:
-                if url not in results:
-                    results[url] = (folder, price_option, sort_order, page)
-
         return urls
 
-
-
-async def extraction_stage(batch_size=100):
-
+async def extraction_stage(batch_size=50):
     logging.info("Using SQLite database at %s", os.path.abspath(DB_FILE))
 
     # 1️⃣ Generate every combination
@@ -267,46 +245,27 @@ async def extraction_stage(batch_size=100):
         for batch_idx in range(total_batches):
             start, end = batch_idx * batch_size, (batch_idx + 1) * batch_size
             batch = remaining[start:end]
-            batch_results = {}
-
             tasks = [
                 extract_page_wrapper(session,
                                      build_page_url(folder, price, sort, page),
                                      semaphore,
-                                     batch_results,
                                      folder, price, sort, page)
                 for folder, price, sort, page in batch
             ]
 
-            # ─── STEP 3: ensure any INSERTs get committed even if cancelled ───
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            finally:
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.commit()
+            except Exception as e:
+                logging.error("Error processing batch %s: %s", batch_idx, e)
 
-            # ─── STEP 4: batch insert combos + record batch index ───
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.executemany(
-                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?)",
-                    [(f, p, s, pg) for f, p, s, pg in batch if batch_results]
-                )
-                await db.execute(
-                    "INSERT OR REPLACE INTO extraction_progress VALUES (1, ?)",
-                    (batch_idx,)
-                )
-                await db.commit()
-
-            await insert_extracted_urls(batch_results)
-
-            logging.info(
-                "Batch %s/%s complete — extracted %s URLs",
-                batch_idx + 1, total_batches, len(batch_results)
-            )
+            logging.info("Batch %s/%s complete.", batch_idx + 1, total_batches)
             await asyncio.sleep(random.uniform(2, 5))
 
     logging.info("Resumed extraction finished; all new pages saved.")
 
+###########################
+# Extraction Test Stage   #
+###########################
 
 async def extraction_test(test_limit=5):
     """
@@ -328,7 +287,14 @@ async def extraction_test(test_limit=5):
                 break
             extracted_url_details[url] = (folder, price, sort_order, page)
     logging.info("Test extracted %s URLs", len(extracted_url_details))
-    await insert_extracted_urls(extracted_url_details)
+    async with aiosqlite.connect(DB_FILE) as db:
+        for url, params in extracted_url_details.items():
+            folder, price_option, sort_order, page = params
+            await db.execute("""
+                INSERT OR IGNORE INTO extracted_urls (url, folder, price_option, sort_order, page)
+                VALUES (?, ?, ?, ?, ?)
+            """, (url, folder, price_option, sort_order, page))
+        await db.commit()
     logging.info("Test extracted URLs saved to SQLite database (%s).", DB_FILE)
     for url, params in extracted_url_details.items():
         print(f"{url} -> {params}")
@@ -362,51 +328,283 @@ async def scrape_product_data(session, url):
     return title, short_description, long_description, rating_value, number_of_ratings, product_price, url
 
 async def processing_stage(batch_size=50):
-    url_records = await get_unique_extracted_urls()
+    url_records = await get_unique_extracted_urls()  # Each record is (url, folder, price_option, sort_order, page)
     total_records = len(url_records)
     logging.info("Total unique URLs to process: %s", total_records)
 
     async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
         for i in range(0, total_records, batch_size):
-            batch = url_records[i:i+batch_size]
-            tasks = [scrape_product_data(session, record[0]) for record in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for j, result in enumerate(results):
-                if result and not isinstance(result, Exception):
-                    url, folder, price_option, sort_order, page = batch[j]
-                    full_data = (*result, folder, price_option, sort_order, page)
-                    await insert_product_data(full_data)
+            batch = url_records[i:i + batch_size]
+            batch_urls = [record[0] for record in batch]
+
+            # Pre-check: query the DB for URLs already processed in this batch.
+            async with aiosqlite.connect(DB_FILE) as db:
+                placeholders = ','.join('?' for _ in batch_urls)
+                query = f"SELECT url FROM product_data WHERE url IN ({placeholders})"
+                async with db.execute(query, batch_urls) as cursor:
+                    processed_rows = await cursor.fetchall()
+                processed_urls = set(row[0] for row in processed_rows)
+
+            # Only process URLs that haven't been scraped yet.
+            tasks = []
+            indices_to_process = []  # Keep track of which indices in the batch need scraping.
+            for idx, record in enumerate(batch):
+                url = record[0]
+                if url not in processed_urls:
+                    tasks.append(scrape_product_data(session, url))
+                    indices_to_process.append(idx)
+
+            pre_skipped = len(batch) - len(tasks)  # Count of URLs pre-skipped from the batch.
+            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+            new_count = 0
+            skipped_count = pre_skipped  # Start with pre-skipped URLs as skipped.
+
+            # Insert newly scraped data into the DB.
+            async with aiosqlite.connect(DB_FILE) as db:
+                for result, idx in zip(results, indices_to_process):
+                    if result and not isinstance(result, Exception):
+                        # Retrieve associated parameters from the batch record.
+                        url, folder, price_option, sort_order, page = batch[idx]
+                        # Build a configuration metadata JSON string from the extraction parameters.
+                        config_metadata = json.dumps({
+                            "folder": folder,
+                            "price_option": price_option,
+                            "sort_order": sort_order,
+                            "page": page
+                        })
+                        full_data = (*result, folder, price_option, sort_order, page, config_metadata)
+                        cursor = await db.execute(
+                            """
+                            INSERT OR IGNORE INTO product_data 
+                            (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page, config_metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, full_data
+                        )
+                        if cursor.rowcount > 0:
+                            new_count += 1
+                        else:
+                            skipped_count += 1
+                    else:
+                        skipped_count += 1
+                await db.commit()
+
+            batch_complete = i + len(batch)
+            percent_complete = (batch_complete / total_records) * 100
             logging.info(
-                "Processed batch %s (%s to %s)",
+                "Processed batch %s (%s to %s): %s new, %s skipped. %.2f%% complete.",
                 (i // batch_size) + 1,
                 i + 1,
-                min(i + batch_size, total_records),
+                i + len(batch),
+                new_count,
+                skipped_count,
+                percent_complete
             )
-            await asyncio.sleep(random.uniform(5, 10))
+
+            # Only sleep if there was any new data inserted.
+            if new_count > 0:
+                await asyncio.sleep(random.uniform(5, 10))
     logging.info("Finished processing unique URLs.")
 
+#############################
+# Free File Download Stage  #
+#############################
+
+async def download_free_file(prod_id, url, session_file="tpt_storage.json", dry_run=False, max_retries=3):
+    from pathlib import Path
+
+    free_url = url.replace("/Product/", "/FreeDownload/")
+    downloads_dir = Path("downloads")
+    downloads_dir.mkdir(exist_ok=True)
+
+    if dry_run:
+        logging.info(f"[Dry Run] Would download: {free_url}")
+        return True  # Pretend success
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    storage_state=session_file,
+                    accept_downloads=True
+                )
+                page = await context.new_page()
+
+                logging.info(f"[{prod_id}] Attempt {attempt}: Navigating to {free_url}")
+                async with page.expect_download() as download_info:
+                    await page.goto(free_url)
+
+                download = await download_info.value
+                suggested_name = download.suggested_filename
+                save_path = downloads_dir / f"{prod_id}_{suggested_name}"
+                await download.save_as(save_path)
+
+                # Verify file exists and is non-empty
+                if not save_path.exists() or save_path.stat().st_size == 0:
+                    raise Exception("Downloaded file is empty or missing.")
+
+                # Informative logging for downloaded file extension
+                logging.info(f"[{prod_id}] File type: {save_path.suffix}")
+
+                # Store in DB
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO free_file_downloads (product_id, free_file_path) VALUES (?, ?)",
+                        (prod_id, str(save_path))
+                    )
+                    await db.commit()
+
+                logging.info(f"[{prod_id}] ✅ Downloaded: {save_path}")
+                await browser.close()
+                return True
+
+        except Exception as e:
+            logging.warning(f"[{prod_id}] ❌ Attempt {attempt} failed: {e}")
+            if attempt == max_retries:
+                logging.error(f"[{prod_id}] ❌ Giving up after {max_retries} attempts.")
+            await asyncio.sleep(2)  # backoff
+
+    return False
+
+
+from tqdm.asyncio import tqdm_asyncio
+
+async def processing_free_download_stage(dry_run=False):
+    # Filters
+    allowed_folders = [
+        "teacher-tools/classroom-management/elementary/preschool",
+        "teacher-tools/classroom-management/elementary/kindergarten",
+        "teacher-tools/classroom-management/elementary/1st-grade",
+        "teacher-tools/classroom-management/elementary/2nd-grade",
+        "teacher-tools/classroom-management/elementary/3rd-grade",
+        "teacher-tools/classroom-management/elementary/4th-grade",
+        "teacher-tools/classroom-management/elementary/5th-grade",
+        "teacher-tools/classroom-management/middle-school/6th-grade",
+        "teacher-tools/classroom-management/middle-school/7th-grade",
+        "teacher-tools/classroom-management/middle-school/8th-grade",
+        "teacher-tools/classroom-management/high-school/9th-grade",
+        "teacher-tools/classroom-management/high-school/10th-grade",
+        "teacher-tools/classroom-management/high-school/11th-grade",
+        "teacher-tools/classroom-management/high-school/12th-grade",
+        "teacher-tools/classroom-management/not-grade-specific",
+    ]
+    allowed_price_option = "free"
+    allowed_sort_orders = [
+        "Relevance", "Rating", "Rating-Count", "Price-Asc", "Price-Desc", "Most-Recent"
+    ]
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            f"""
+            SELECT id, url, product_price FROM product_data 
+            WHERE price_option = ?
+              AND folder IN ({','.join(['?'] * len(allowed_folders))})
+              AND sort_order IN ({','.join(['?'] * len(allowed_sort_orders))})
+              AND id NOT IN (SELECT product_id FROM free_file_downloads)
+            """,
+            [allowed_price_option] + allowed_folders + allowed_sort_orders
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    logging.info(f"🔎 Found {len(rows)} products to download.")
+    failures = []
+
+    # Use asyncio tasks with progress bar
+    sem = asyncio.Semaphore(5)
+
+    async def worker(row):
+        async with sem:
+            prod_id, url, _ = row
+            success = await download_free_file(prod_id, url, dry_run=dry_run)
+            if not success:
+                failures.append(prod_id)
+
+    await tqdm_asyncio.gather(*(worker(row) for row in rows), desc="Downloading")
+
+    if failures:
+        logging.warning(f"❌ Failed to download {len(failures)} product(s): {failures}")
+    else:
+        logging.info("✅ All downloads succeeded.")
+
+
+
+#############################
+# Update & Check Config Metadata Functions
+#############################
+
+async def add_config_metadata_column_if_needed():
+    """
+    Check if the 'config_metadata' column exists in product_data.
+    If not, add the column.
+    """
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("PRAGMA table_info(product_data)") as cursor:
+            columns = await cursor.fetchall()
+        if not any(col[1] == "config_metadata" for col in columns):
+            await db.execute("ALTER TABLE product_data ADD COLUMN config_metadata TEXT")
+            await db.commit()
+            logging.info("Added config_metadata column to product_data table.")
+        else:
+            logging.info("config_metadata column already exists.")
+
+async def update_config_metadata():
+    """
+    Update existing product_data records by setting the config_metadata field 
+    based on the existing folder, price_option, sort_order, and page values.
+    """
+    # First, ensure the column exists.
+    await add_config_metadata_column_if_needed()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            UPDATE product_data
+            SET config_metadata = json_object(
+                'folder', folder,
+                'price_option', price_option,
+                'sort_order', sort_order,
+                'page', page
+            )
+            WHERE config_metadata IS NULL
+        """)
+        await db.commit()
+    logging.info("Updated config_metadata for existing records.")
+
+async def check_config_metadata():
+    """
+    Check and print out a sample of records with the config_metadata field set.
+    """
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT COUNT(*) FROM product_data WHERE config_metadata IS NOT NULL") as cursor:
+            count = await cursor.fetchone()
+            print("Records with config_metadata set:", count[0])
+        
+        async with db.execute("SELECT id, folder, price_option, sort_order, page, config_metadata FROM product_data LIMIT 5") as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                print(row)
 
 ###########################
 # Main Entry Point        #
 ###########################
 
 async def main():
-    # Note: Using the built-in input() in an async function blocks the event loop.
-    # For advanced applications, consider an asynchronous alternative.
-    await setup_db()  # Ensure our database and tables are created
-    print("Choose an option:")
-    print("0. Test Extraction Stage (Extract 5 URLs)")
-    print("1. Full Extraction Stage: Extract and store product URLs (SQLite)")
-    print("2. Processing Stage: Scrape product data from stored URLs and save in SQLite")
-    choice = input("Enter 0, 1 or 2: ").strip()
-    if choice == "0":
+    parser = argparse.ArgumentParser(description="TPT Scraper Tool")
+    parser.add_argument("--stage", choices=["test", "extract", "process", "download", "update"], required=True, help="Stage to run")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode for download stage")
+    args = parser.parse_args()
+
+    await setup_db()
+
+    if args.stage == "test":
         await extraction_test()
-    elif choice == "1":
+    elif args.stage == "extract":
         await extraction_stage()
-    elif choice == "2":
+    elif args.stage == "process":
         await processing_stage()
-    else:
-        print("Invalid choice.")
+    elif args.stage == "download":
+        await processing_free_download_stage(dry_run=args.dry_run)
+    elif args.stage == "update":
+        await update_config_metadata()
+        await check_config_metadata()
 
 if __name__ == "__main__":
     asyncio.run(main())

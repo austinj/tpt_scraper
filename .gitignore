@@ -1,8 +1,9 @@
 # Custom
 output/
-scrape_cache.db
 scrape_cache.db*
 sqlite3.exe
+free_product_export/
+tpt_storage.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
