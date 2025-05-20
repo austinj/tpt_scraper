@@ -106,6 +106,7 @@ async def setup_db():
                 rating_value TEXT,
                 number_of_ratings TEXT,
                 product_price TEXT,
+                preview_keywords TEXT,
                 url TEXT UNIQUE,
                 folder TEXT,
                 price_option TEXT,
@@ -114,6 +115,13 @@ async def setup_db():
                 config_metadata TEXT
             )
         """)
+        # --- Add this migration code ---
+        async with db.execute("PRAGMA table_info(product_data)") as cursor:
+            columns = await cursor.fetchall()
+        if not any(col[1] == "preview_keywords" for col in columns):
+            await db.execute("ALTER TABLE product_data ADD COLUMN preview_keywords TEXT")
+            await db.commit()
+        # --- End migration code ---
         await db.commit()
 
 async def insert_product_data(data):
@@ -121,13 +129,13 @@ async def insert_product_data(data):
     Insert product data along with configuration parameters.
     Data should be a tuple in the form:
     (title, short_description, long_description, rating_value, number_of_ratings,
-     product_price, url, folder, price_option, sort_order, page, config_metadata)
+     product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
     """
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             INSERT OR IGNORE INTO product_data 
-            (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page, config_metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         await db.commit()
 
@@ -325,7 +333,20 @@ async def scrape_product_data(session, url):
             number_of_ratings = parts[-2]
     meta_price = soup.find("meta", {"name": "price"})
     product_price = meta_price["content"] if meta_price and meta_price.has_attr("content") else None
-    return title, short_description, long_description, rating_value, number_of_ratings, product_price, url
+
+    grade_level = None
+    grade_elem = soup.select_one('[data-testid="RebrandedContentText"] .NotLinkedSection span')
+    if grade_elem:
+        grade_level = grade_elem.get_text(strip=True)
+    categories = []
+    category_elems = soup.select('div[data-testid="LabeledSectionContent"] a.Link-module__link--GFbUH')
+    if category_elems:
+        categories = [cat.get_text(strip=True) for cat in category_elems]
+    preview_keywords = ""
+    if grade_level or categories:
+        preview_keywords = (grade_level or "") + (" " if grade_level and categories else "") + ", ".join(categories)
+
+    return title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url
 
 async def processing_stage(batch_size=50):
     url_records = await get_unique_extracted_urls()  # Each record is (url, folder, price_option, sort_order, page)
@@ -376,8 +397,8 @@ async def processing_stage(batch_size=50):
                         cursor = await db.execute(
                             """
                             INSERT OR IGNORE INTO product_data 
-                            (title, short_description, long_description, rating_value, number_of_ratings, product_price, url, folder, price_option, sort_order, page, config_metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, full_data
                         )
                         if cursor.rowcount > 0:
@@ -583,16 +604,95 @@ async def check_config_metadata():
                 print(row)
 
 ###########################
+# Backfill Preview Keywords Stage
+###########################
+
+async def backfill_preview_keywords(batch_size=50, concurrency=20):
+    """
+    Find product_data records missing preview_keywords, scrape, and update them.
+    """
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id, url FROM product_data WHERE preview_keywords IS NULL OR preview_keywords = ''"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        logging.info("No records missing preview_keywords.")
+        return
+
+    logging.info(f"Backfilling preview_keywords for {len(rows)} records.")
+
+    total = len(rows)
+    sem = asyncio.Semaphore(concurrency)
+    async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
+        async with aiosqlite.connect(DB_FILE) as db:  # Reuse connection
+            for i in range(0, total, batch_size):
+                batch = rows[i:i+batch_size]
+                async def scrape_with_sem(url):
+                    async with sem:
+                        return await scrape_product_data(session, url)
+                tasks = [scrape_with_sem(url) for _, url in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                updates = []
+                for (row, result) in zip(batch, results):
+                    prod_id, url = row
+                    if result and not isinstance(result, Exception):
+                        preview_keywords = result[6]  # 7th item in tuple
+                        if preview_keywords:
+                            updates.append((preview_keywords, prod_id))
+                if updates:
+                    await db.executemany(
+                        "UPDATE product_data SET preview_keywords = ? WHERE id = ?",
+                        updates
+                    )
+                    await db.commit()
+                completed = min(i + batch_size, total)
+                percent = (completed / total) * 100
+                logging.info(f"Updated {len(updates)} records in batch {i//batch_size+1}. {completed}/{total} ({percent:.2f}%%) complete.")
+
+    logging.info("Backfill of preview_keywords complete.")
+
+###########################
 # Main Entry Point        #
 ###########################
 
 async def main():
-    parser = argparse.ArgumentParser(description="TPT Scraper Tool")
-    parser.add_argument("--stage", choices=["test", "extract", "process", "download", "update"], required=True, help="Stage to run")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run mode for download stage")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="TPT Scraper Tool: Extract, process, and download TPT product data."
+    )
+    subparsers = parser.add_subparsers(dest="stage", required=True, help="Stage to run")
 
+    # Test stage
+    subparsers.add_parser("test", help="Test extraction on a single page.")
+
+    # Extract stage
+    subparsers.add_parser("extract", help="Extract product URLs for all config combinations.")
+
+    # Process stage
+    subparsers.add_parser("process", help="Process and scrape product data for extracted URLs.")
+
+    # Download stage
+    download_parser = subparsers.add_parser("download", help="Download free files for eligible products.")
+    download_parser.add_argument("--dry-run", action="store_true", help="List downloads without saving files.")
+
+    # Update stage
+    subparsers.add_parser("update", help="Update config metadata for product data.")
+
+    # Backfill preview_keywords (as a separate flag, not a stage)
+    parser.add_argument(
+        "--backfill-preview",
+        action="store_true",
+        help="Backfill missing preview_keywords for product data (runs independently of stage)."
+    )
+
+    args = parser.parse_args()
     await setup_db()
+
+    # Run backfill_preview_keywords exclusively if requested
+    if args.backfill_preview:
+        await backfill_preview_keywords()
+        return
 
     if args.stage == "test":
         await extraction_test()
@@ -601,7 +701,7 @@ async def main():
     elif args.stage == "process":
         await processing_stage()
     elif args.stage == "download":
-        await processing_free_download_stage(dry_run=args.dry_run)
+        await processing_free_download_stage(dry_run=getattr(args, "dry_run", False))
     elif args.stage == "update":
         await update_config_metadata()
         await check_config_metadata()
