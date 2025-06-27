@@ -7,6 +7,7 @@ import logging
 import aiosqlite
 import math
 import os
+import re
 import argparse
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -25,9 +26,13 @@ def load_config(config_file=CONFIG_FILE):
     except Exception as e:
         logging.error("Error loading config: %s", e)
         return {
-            "folder_structures": ["teacher-tools/classroom-management", "teacher-tools/subject-math"],
-            "price_options": ["", "on-sale"],
-            "sorting_methods": ["Relevance", "Rating", "Price-Low-to-High", "Newest"],
+            "resource_type": ["", "teacher-tools"],
+            "grade_level": ["", "elementary"],
+            "subject": ["social-emotional"],
+            "format": ["", "pdf"],
+            "price_options": ["", "free"],
+            "supports": [""],
+            "sorting_methods": ["Relevance", "Rating"],
             "total_pages": 42,
             "concurrent_requests": 10,
             "max_retries": 3,
@@ -38,8 +43,12 @@ def load_config(config_file=CONFIG_FILE):
         }
 
 config = load_config()
-FOLDER_STRUCTURES = config.get("folder_structures", [])
+RESOURCE_TYPES = config.get("resource_type", [])
+GRADE_LEVELS = config.get("grade_level", [])
+SUBJECTS = config.get("subject", [])
+FORMATS = config.get("format", [])
 PRICE_OPTIONS = config.get("price_options", [])
+SUPPORTS = config.get("supports", [])
 SORTING_METHODS = config.get("sorting_methods", [])
 TOTAL_PAGES = config.get("total_pages", 42)
 CONCURRENT_REQUESTS = config.get("concurrent_requests", 10)
@@ -64,19 +73,27 @@ async def setup_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS extracted_urls (
                 url TEXT PRIMARY KEY,
-                folder TEXT,
+                resource_type TEXT,
+                grade_level TEXT,
+                subject TEXT,
+                format TEXT,
                 price_option TEXT,
+                supports TEXT,
                 sort_order TEXT,
                 page INTEGER
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS extracted_pages (
-                folder TEXT,
+                resource_type TEXT,
+                grade_level TEXT,
+                subject TEXT,
+                format TEXT,
                 price_option TEXT,
+                supports TEXT,
                 sort_order TEXT,
                 page INTEGER,
-                PRIMARY KEY(folder, price_option, sort_order, page)
+                PRIMARY KEY(resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
             )
         """)
         # Extraction progress table
@@ -89,14 +106,18 @@ async def setup_db():
         await db.execute("""
             CREATE VIEW IF NOT EXISTS unique_extracted_urls AS
             SELECT url,
-                   MIN(folder) AS folder,
+                   MIN(resource_type) AS resource_type,
+                   MIN(grade_level) AS grade_level,
+                   MIN(subject) AS subject,
+                   MIN(format) AS format,
                    MIN(price_option) AS price_option,
+                   MIN(supports) AS supports,
                    MIN(sort_order) AS sort_order,
                    MIN(page) AS page
             FROM extracted_urls
             GROUP BY url
         """)
-        # Updated product_data table with configuration metadata.
+        # Updated product_data table with new URL parameters.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS product_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,8 +129,12 @@ async def setup_db():
                 product_price TEXT,
                 preview_keywords TEXT,
                 url TEXT UNIQUE,
-                folder TEXT,
+                resource_type TEXT,
+                grade_level TEXT,
+                subject TEXT,
+                format TEXT,
                 price_option TEXT,
+                supports TEXT,
                 sort_order TEXT,
                 page INTEGER,
                 config_metadata TEXT
@@ -129,20 +154,20 @@ async def insert_product_data(data):
     Insert product data along with configuration parameters.
     Data should be a tuple in the form:
     (title, short_description, long_description, rating_value, number_of_ratings,
-     product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
+     product_price, preview_keywords, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, config_metadata)
     """
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             INSERT OR IGNORE INTO product_data 
-            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, config_metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         await db.commit()
 
 async def get_unique_extracted_urls():
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT url, folder, price_option, sort_order, page FROM unique_extracted_urls"
+            "SELECT url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page FROM unique_extracted_urls"
         ) as cursor:
             return await cursor.fetchall()
 
@@ -150,18 +175,44 @@ async def get_unique_extracted_urls():
 # URL Building and Fetch  #
 ###########################
 
-def build_page_url(folder_structure, price_option, sort_order, page):
+def build_page_url(resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page):
     """
-    Builds a complete URL based on the folder structure, price option, sort order, and page number.
-    For "Relevance", no order parameter is appended.
+    Builds a complete URL based on the new URL structure:
+    https://www.teacherspayteachers.com/browse/[resource-type]/[grade-level]/[subject]/[format]/[price]/[supports]?order=[sorting-method]
     """
-    base_url = f"https://www.teacherspayteachers.com/browse/{folder_structure}"
+    url_parts = ["https://www.teacherspayteachers.com/browse"]
+    
+    # Add each URL component if it's not empty
+    if resource_type:
+        url_parts.append(resource_type)
+    if grade_level:
+        url_parts.append(grade_level)
+    if subject:
+        url_parts.append(subject)
+    if format_type:
+        url_parts.append(format_type)
     if price_option:
-        base_url = f"{base_url}/{price_option}"
-    if sort_order == "Relevance":
-        return base_url if page == 1 else f"{base_url}?page={page}"
+        url_parts.append(price_option)
+    if supports:
+        url_parts.append(supports)
+    
+    base_url = "/".join(url_parts)
+    
+    # Add query parameters
+    query_params = []
+    
+    # Add sorting (unless it's Relevance which is default)
+    if sort_order and sort_order != "Relevance":
+        query_params.append(f"order={sort_order}")
+    
+    # Add page number if not the first page
+    if page > 1:
+        query_params.append(f"page={page}")
+    
+    if query_params:
+        return f"{base_url}?{'&'.join(query_params)}"
     else:
-        return f"{base_url}?order={sort_order}&page={page}"
+        return base_url
 
 async def fetch(session, url):
     """Fetches a URL using aiohttp with retry logic and exponential backoff."""
@@ -203,7 +254,7 @@ async def extract_urls_from_page(session, page_url):
             urls.append(full_url)
     return urls
 
-async def extract_page_wrapper(session, page_url, semaphore, folder, price_option, sort_order, page):
+async def extract_page_wrapper(session, page_url, semaphore, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page):
     async with semaphore:
         logging.info("Fetching page: %s", page_url)
         urls = await extract_urls_from_page(session, page_url)
@@ -211,13 +262,13 @@ async def extract_page_wrapper(session, page_url, semaphore, folder, price_optio
             async with aiosqlite.connect(DB_FILE) as db:
                 # Immediately mark the page as processed and insert URLs
                 await db.execute(
-                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?)",
-                    (folder, price_option, sort_order, page),
+                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page),
                 )
                 for url in urls:
                     await db.execute(
-                        "INSERT OR IGNORE INTO extracted_urls (url, folder, price_option, sort_order, page) VALUES (?, ?, ?, ?, ?)",
-                        (url, folder, price_option, sort_order, page)
+                        "INSERT OR IGNORE INTO extracted_urls (url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (url, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
                     )
                 await db.commit()
         return urls
@@ -225,19 +276,23 @@ async def extract_page_wrapper(session, page_url, semaphore, folder, price_optio
 async def extraction_stage(batch_size=50):
     logging.info("Using SQLite database at %s", os.path.abspath(DB_FILE))
 
-    # 1️⃣ Generate every combination
+    # 1️⃣ Generate every combination of the new parameters
     combos = [
-        (folder, price, sort, page)
-        for folder in FOLDER_STRUCTURES
-        for price in PRICE_OPTIONS
-        for sort in SORTING_METHODS
+        (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
+        for resource_type in RESOURCE_TYPES
+        for grade_level in GRADE_LEVELS
+        for subject in SUBJECTS
+        for format_type in FORMATS
+        for price_option in PRICE_OPTIONS
+        for supports in SUPPORTS
+        for sort_order in SORTING_METHODS
         for page in range(1, TOTAL_PAGES + 1)
     ]
 
     # 2️⃣ Load already‑done combos from the DB
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("""
-            SELECT folder, price_option, sort_order, page 
+            SELECT resource_type, grade_level, subject, format, price_option, supports, sort_order, page 
             FROM extracted_pages
         """) as cursor:
             done_combos = set(await cursor.fetchall())
@@ -255,10 +310,10 @@ async def extraction_stage(batch_size=50):
             batch = remaining[start:end]
             tasks = [
                 extract_page_wrapper(session,
-                                     build_page_url(folder, price, sort, page),
+                                     build_page_url(resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page),
                                      semaphore,
-                                     folder, price, sort, page)
-                for folder, price, sort, page in batch
+                                     resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
+                for resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page in batch
             ]
 
             try:
@@ -281,27 +336,31 @@ async def extraction_test(test_limit=5):
     stores up to test_limit URLs with their parameters in the SQLite database,
     and prints them.
     """
-    extracted_url_details = {}  # dict mapping url -> (folder, price_option, sort_order, page)
+    extracted_url_details = {}  # dict mapping url -> (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
     async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
-        folder = FOLDER_STRUCTURES[0] if FOLDER_STRUCTURES else "teacher-tools/classroom-management"
-        price = PRICE_OPTIONS[0] if PRICE_OPTIONS else ""
+        resource_type = RESOURCE_TYPES[0] if RESOURCE_TYPES else ""
+        grade_level = GRADE_LEVELS[0] if GRADE_LEVELS else ""
+        subject = SUBJECTS[0] if SUBJECTS else "social-emotional"
+        format_type = FORMATS[0] if FORMATS else ""
+        price_option = PRICE_OPTIONS[0] if PRICE_OPTIONS else ""
+        supports = SUPPORTS[0] if SUPPORTS else ""
         sort_order = SORTING_METHODS[0] if SORTING_METHODS else "Relevance"
         page = 1
-        page_url = build_page_url(folder, price, sort_order, page)
+        page_url = build_page_url(resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
         logging.info("Test fetching page: %s", page_url)
         urls = await extract_urls_from_page(session, page_url)
         for url in urls:
             if len(extracted_url_details) >= test_limit:
                 break
-            extracted_url_details[url] = (folder, price, sort_order, page)
+            extracted_url_details[url] = (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
     logging.info("Test extracted %s URLs", len(extracted_url_details))
     async with aiosqlite.connect(DB_FILE) as db:
         for url, params in extracted_url_details.items():
-            folder, price_option, sort_order, page = params
+            resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page = params
             await db.execute("""
-                INSERT OR IGNORE INTO extracted_urls (url, folder, price_option, sort_order, page)
-                VALUES (?, ?, ?, ?, ?)
-            """, (url, folder, price_option, sort_order, page))
+                INSERT OR IGNORE INTO extracted_urls (url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (url, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page))
         await db.commit()
     logging.info("Test extracted URLs saved to SQLite database (%s).", DB_FILE)
     for url, params in extracted_url_details.items():
@@ -331,8 +390,58 @@ async def scrape_product_data(session, url):
         if len(parts) >= 3:
             rating_value = parts[1]
             number_of_ratings = parts[-2]
-    meta_price = soup.find("meta", {"name": "price"})
-    product_price = meta_price["content"] if meta_price and meta_price.has_attr("content") else None
+    # Try multiple methods to extract price
+    product_price = None
+    
+    # Method 1: Check for meta tag with property="product:price:amount"
+    meta_price = soup.find("meta", {"property": "product:price:amount"})
+    if meta_price and meta_price.has_attr("content"):
+        product_price = meta_price["content"]
+    
+    # Method 2: If not found, try JSON-LD structured data
+    if not product_price:
+        script_tags = soup.find_all("script", {"type": "application/ld+json"})
+        for script in script_tags:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and data.get("@type") == "Product":
+                    offers = data.get("offers", {})
+                    if offers and offers.get("price"):
+                        product_price = offers.get("price")
+                        break
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") == "Product":
+                            offers = item.get("offers", {})
+                            if offers and offers.get("price"):
+                                product_price = offers.get("price")
+                                break
+                    if product_price:
+                        break
+            except:
+                continue
+    
+    # Method 3: If still not found, try CSS selectors for price elements
+    if not product_price:
+        price_selectors = [
+            "[class*='Price'] span",
+            "[class*='price']",
+            "[data-testid*='price']"
+        ]
+        for selector in price_selectors:
+            price_elem = soup.select_one(selector)
+            if price_elem:
+                price_text = price_elem.get_text(strip=True)
+                # Extract price from text like "$120.00" or "FREE"
+                if price_text and ('$' in price_text or 'free' in price_text.lower()):
+                    if 'free' in price_text.lower():
+                        product_price = "0.00"
+                    else:
+                        # Extract numeric price from text like "$120.00$180.00" -> "120.00"
+                        price_match = re.search(r'\$([0-9]+\.?[0-9]*)', price_text)
+                        if price_match:
+                            product_price = price_match.group(1)
+                    break
 
     grade_level = None
     grade_elem = soup.select_one('[data-testid="RebrandedContentText"] .NotLinkedSection span')
@@ -349,7 +458,7 @@ async def scrape_product_data(session, url):
     return title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url
 
 async def processing_stage(batch_size=50):
-    url_records = await get_unique_extracted_urls()  # Each record is (url, folder, price_option, sort_order, page)
+    url_records = await get_unique_extracted_urls()  # Each record is (url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
     total_records = len(url_records)
     logging.info("Total unique URLs to process: %s", total_records)
 
@@ -385,20 +494,24 @@ async def processing_stage(batch_size=50):
                 for result, idx in zip(results, indices_to_process):
                     if result and not isinstance(result, Exception):
                         # Retrieve associated parameters from the batch record.
-                        url, folder, price_option, sort_order, page = batch[idx]
+                        url, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page = batch[idx]
                         # Build a configuration metadata JSON string from the extraction parameters.
                         config_metadata = json.dumps({
-                            "folder": folder,
+                            "resource_type": resource_type,
+                            "grade_level": grade_level,
+                            "subject": subject,
+                            "format": format_type,
                             "price_option": price_option,
+                            "supports": supports,
                             "sort_order": sort_order,
                             "page": page
                         })
-                        full_data = (*result, folder, price_option, sort_order, page, config_metadata)
+                        full_data = (*result, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page, config_metadata)
                         cursor = await db.execute(
                             """
                             INSERT OR IGNORE INTO product_data 
-                            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, folder, price_option, sort_order, page, config_metadata)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, config_metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, full_data
                         )
                         if cursor.rowcount > 0:
@@ -571,7 +684,7 @@ async def add_config_metadata_column_if_needed():
 async def update_config_metadata():
     """
     Update existing product_data records by setting the config_metadata field 
-    based on the existing folder, price_option, sort_order, and page values.
+    based on the existing URL parameters.
     """
     # First, ensure the column exists.
     await add_config_metadata_column_if_needed()
@@ -579,8 +692,12 @@ async def update_config_metadata():
         await db.execute("""
             UPDATE product_data
             SET config_metadata = json_object(
-                'folder', folder,
+                'resource_type', resource_type,
+                'grade_level', grade_level,
+                'subject', subject,
+                'format', format,
                 'price_option', price_option,
+                'supports', supports,
                 'sort_order', sort_order,
                 'page', page
             )
@@ -598,7 +715,7 @@ async def check_config_metadata():
             count = await cursor.fetchone()
             print("Records with config_metadata set:", count[0])
         
-        async with db.execute("SELECT id, folder, price_option, sort_order, page, config_metadata FROM product_data LIMIT 5") as cursor:
+        async with db.execute("SELECT id, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, config_metadata FROM product_data LIMIT 5") as cursor:
             rows = await cursor.fetchall()
             for row in rows:
                 print(row)
