@@ -1,4 +1,5 @@
 import asyncio
+import aiohttp
 import aiohttp_client_cache
 import async_timeout
 import random
@@ -9,10 +10,13 @@ import math
 import os
 import re
 import argparse
+import time
 from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from tqdm.asyncio import tqdm_asyncio
+from collections import deque
+from typing import Optional, Tuple
 
 CONFIG_FILE = "config.json"
 DB_FILE = "scrape_cache.db"
@@ -50,6 +54,87 @@ FORMATS = config.get("format", [])
 PRICE_OPTIONS = config.get("price_options", [])
 SUPPORTS = config.get("supports", [])
 SORTING_METHODS = config.get("sorting_methods", [])
+
+class AdaptiveRateLimiter:
+    """Adaptive rate limiter that adjusts based on response times and errors."""
+    
+    def __init__(self, initial_delay=1.0, max_delay=30.0, error_threshold=0.1):
+        self.current_delay = initial_delay
+        self.max_delay = max_delay
+        self.error_threshold = error_threshold
+        self.recent_responses = deque(maxlen=100)  # Track last 100 responses
+        self.error_count = 0
+        self.total_count = 0
+        
+    def record_response(self, success: bool, response_time: float):
+        """Record a response and its timing."""
+        self.recent_responses.append((success, response_time, time.time()))
+        self.total_count += 1
+        if not success:
+            self.error_count += 1
+            
+    def adjust_delay(self):
+        """Adjust delay based on recent performance."""
+        if len(self.recent_responses) < 10:
+            return self.current_delay
+            
+        # Calculate recent error rate
+        recent_errors = sum(1 for success, _, _ in self.recent_responses if not success)
+        error_rate = recent_errors / len(self.recent_responses)
+        
+        # Calculate average response time
+        avg_response_time = sum(rt for _, rt, _ in self.recent_responses) / len(self.recent_responses)
+        
+        # Adjust delay based on error rate and response time
+        if error_rate > self.error_threshold:
+            # Increase delay if too many errors
+            self.current_delay = min(self.current_delay * 1.5, self.max_delay)
+        elif error_rate < self.error_threshold / 2 and avg_response_time < 2.0:
+            # Decrease delay if doing well
+            self.current_delay = max(self.current_delay * 0.9, 0.1)
+            
+        return self.current_delay
+        
+    async def wait(self):
+        """Wait for the current delay period."""
+        delay = self.adjust_delay()
+        await asyncio.sleep(delay)
+
+class SmartBatcher:
+    """Smart batcher that optimizes batch sizes based on performance."""
+    
+    def __init__(self, min_batch_size=5, max_batch_size=50, target_time=30.0):
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.target_time = target_time
+        self.current_batch_size = min_batch_size
+        self.performance_history = deque(maxlen=10)
+        
+    def record_batch_performance(self, batch_size: int, duration: float, success_rate: float):
+        """Record performance of a batch."""
+        self.performance_history.append((batch_size, duration, success_rate))
+        
+    def get_next_batch_size(self) -> int:
+        """Calculate optimal batch size based on performance history."""
+        if len(self.performance_history) < 3:
+            return self.current_batch_size
+            
+        # Analyze recent performance
+        recent_performance = list(self.performance_history)[-3:]
+        avg_duration = sum(d for _, d, _ in recent_performance) / len(recent_performance)
+        avg_success_rate = sum(sr for _, _, sr in recent_performance) / len(recent_performance)
+        
+        # Adjust batch size based on performance
+        if avg_success_rate < 0.8:  # Too many failures
+            self.current_batch_size = max(self.current_batch_size - 5, self.min_batch_size)
+        elif avg_duration < self.target_time * 0.7 and avg_success_rate > 0.95:
+            # Can handle more
+            self.current_batch_size = min(self.current_batch_size + 3, self.max_batch_size)
+        elif avg_duration > self.target_time * 1.3:
+            # Taking too long
+            self.current_batch_size = max(self.current_batch_size - 2, self.min_batch_size)
+            
+        return self.current_batch_size
 TOTAL_PAGES = config.get("total_pages", 42)
 CONCURRENT_REQUESTS = config.get("concurrent_requests", 10)
 MAX_RETRIES = config.get("max_retries", 3)
@@ -67,8 +152,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 async def setup_db():
     """Creates the SQLite database and tables if they don't exist."""
     async with aiosqlite.connect(DB_FILE) as db:
+        # Enhanced SQLite performance settings
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("PRAGMA cache_size=10000;")  # 10MB cache
+        await db.execute("PRAGMA temp_store=MEMORY;")
+        await db.execute("PRAGMA mmap_size=268435456;")  # 256MB memory mapping
+        await db.execute("PRAGMA optimize;")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS extracted_urls (
@@ -140,6 +230,7 @@ async def setup_db():
                 config_metadata TEXT
             )
         """)
+        
         # --- Add this migration code ---
         async with db.execute("PRAGMA table_info(product_data)") as cursor:
             columns = await cursor.fetchall()
@@ -147,6 +238,44 @@ async def setup_db():
             await db.execute("ALTER TABLE product_data ADD COLUMN preview_keywords TEXT")
             await db.commit()
         # --- End migration code ---
+        
+        # Create performance indexes
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_extracted_urls_url ON extracted_urls(url);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_product_data_url ON product_data(url);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_product_data_price_option ON product_data(price_option);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_product_data_resource_type ON product_data(resource_type);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_product_data_preview_keywords ON product_data(preview_keywords);")
+        
+        # Add performance monitoring table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS performance_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                stage TEXT,
+                batch_size INTEGER,
+                duration REAL,
+                success_rate REAL,
+                error_rate REAL,
+                items_processed INTEGER
+            )
+        """)
+        
+        # Add empty combinations tracking table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS empty_combinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_type TEXT,
+                grade_level TEXT,
+                subject TEXT,
+                format TEXT,
+                price_option TEXT,
+                supports TEXT,
+                sort_order TEXT,
+                discovered_timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(resource_type, grade_level, subject, format, price_option, supports, sort_order)
+            )
+        """)
+        
         await db.commit()
 
 async def insert_product_data(data):
@@ -170,6 +299,37 @@ async def get_unique_extracted_urls():
             "SELECT url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page FROM unique_extracted_urls"
         ) as cursor:
             return await cursor.fetchall()
+
+async def get_empty_combinations():
+    """Get list of combinations known to be empty."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("""
+            SELECT resource_type, grade_level, subject, format, price_option, supports, sort_order
+            FROM empty_combinations
+        """) as cursor:
+            return set(await cursor.fetchall())
+
+async def mark_combination_empty(resource_type, grade_level, subject, format_type, price_option, supports, sort_order):
+    """Mark a combination as empty to avoid future processing."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO empty_combinations 
+            (resource_type, grade_level, subject, format, price_option, supports, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (resource_type, grade_level, subject, format_type, price_option, supports, sort_order))
+        await db.commit()
+
+async def load_valid_combinations():
+    """Load pre-filtered valid combinations if available."""
+    try:
+        with open("valid_combinations.json", "r") as f:
+            data = json.load(f)
+        valid_combos = [tuple(combo) for combo in data.get("valid_combinations", [])]
+        logging.info(f"Loaded {len(valid_combos):,} pre-filtered valid combinations")
+        return valid_combos
+    except FileNotFoundError:
+        logging.info("No pre-filtered combinations found, will process all combinations")
+        return None
 
 ###########################
 # URL Building and Fetch  #
@@ -214,34 +374,79 @@ def build_page_url(resource_type, grade_level, subject, format_type, price_optio
     else:
         return base_url
 
-async def fetch(session, url):
-    """Fetches a URL using aiohttp with retry logic and exponential backoff."""
+async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None):
+    """Fetches a URL using aiohttp with adaptive rate limiting and improved retry logic."""
     retries = 0
-    backoff = 1
-    while retries < MAX_RETRIES:
+    backoff = config.get("retry_backoff_start", 1)
+    backoff_factor = config.get("retry_backoff_factor", 2)
+    max_retries = config.get("max_retries", 3)
+    
+    while retries < max_retries:
+        start_time = time.time()
         try:
+            # Apply rate limiting
+            if rate_limiter:
+                await rate_limiter.wait()
+                
             async with async_timeout.timeout(30):
                 async with session.get(url) as response:
+                    response_time = time.time() - start_time
+                    
                     if response.status == 200:
+                        if rate_limiter:
+                            rate_limiter.record_response(True, response_time)
                         return await response.text()
-                    else:
-                        logging.warning("Non-200 status %s for URL: %s", response.status, url)
-                        raise Exception(f"Status {response.status}")
-        except Exception as e:
+                    elif response.status == 429:  # Rate limited
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        retry_after = response.headers.get('Retry-After', backoff)
+                        try:
+                            retry_after = int(retry_after)
+                        except (ValueError, TypeError):
+                            retry_after = backoff
+                        logging.warning("Rate limited (429) for URL: %s. Waiting %s seconds", url, retry_after)
+                        await asyncio.sleep(retry_after)
+                        raise Exception(f"Rate limited (429)")
+                    elif response.status >= 500:  # Server error - retry
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        logging.warning("Server error %s for URL: %s", response.status, url)
+                        raise Exception(f"Server error {response.status}")
+                    else:  # Client error - don't retry
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        logging.warning("Client error %s for URL: %s", response.status, url)
+                        return None
+                        
+        except asyncio.TimeoutError:
+            response_time = time.time() - start_time
+            if rate_limiter:
+                rate_limiter.record_response(False, response_time)
             retries += 1
-            logging.warning("Error fetching %s: %s. Retry %s/%s in %s sec", url, e, retries, MAX_RETRIES, backoff)
-            await asyncio.sleep(backoff)
-            backoff *= 2
-    logging.error("Failed to fetch %s after %s retries", url, MAX_RETRIES)
+            logging.warning("Timeout fetching %s. Retry %s/%s in %s sec", url, retries, max_retries, backoff)
+            if retries < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= backoff_factor
+        except Exception as e:
+            response_time = time.time() - start_time
+            if rate_limiter:
+                rate_limiter.record_response(False, response_time)
+            retries += 1
+            logging.warning("Error fetching %s: %s. Retry %s/%s in %s sec", url, e, retries, max_retries, backoff)
+            if retries < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= backoff_factor
+                
+    logging.error("Failed to fetch %s after %s retries", url, max_retries)
     return None
 
 ###########################
 # Extraction Stage        #
 ###########################
 
-async def extract_urls_from_page(session, page_url):
+async def extract_urls_from_page(session, page_url, rate_limiter: Optional[AdaptiveRateLimiter] = None):
     """Extracts product URLs from a single page using BeautifulSoup (lxml parser)."""
-    html = await fetch(session, page_url)
+    html = await fetch(session, page_url, rate_limiter)
     if not html:
         return []
     soup = BeautifulSoup(html, "lxml")
@@ -254,10 +459,17 @@ async def extract_urls_from_page(session, page_url):
             urls.append(full_url)
     return urls
 
-async def extract_page_wrapper(session, page_url, semaphore, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page):
+async def extract_page_wrapper(session, page_url, semaphore, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page, rate_limiter: Optional[AdaptiveRateLimiter] = None):
     async with semaphore:
         logging.info("Fetching page: %s", page_url)
-        urls = await extract_urls_from_page(session, page_url)
+        urls = await extract_urls_from_page(session, page_url, rate_limiter)
+        
+        # Smart empty combination detection
+        if page == 1 and len(urls) == 0:
+            # If page 1 of a combination is empty, mark the whole combination as empty
+            await mark_combination_empty(resource_type, grade_level, subject, format_type, price_option, supports, sort_order)
+            logging.info(f"Marked empty combination: {resource_type}/{grade_level}/{subject}/{format_type}/{price_option}/{supports}/{sort_order}")
+        
         if urls:
             async with aiosqlite.connect(DB_FILE) as db:
                 # Immediately mark the page as processed and insert URLs
@@ -271,25 +483,78 @@ async def extract_page_wrapper(session, page_url, semaphore, resource_type, grad
                         (url, resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
                     )
                 await db.commit()
+        else:
+            # Even if no URLs, mark the page as processed to avoid re-processing
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO extracted_pages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page),
+                )
+                await db.commit()
+        
         return urls
 
-async def extraction_stage(batch_size=50):
+async def extraction_stage(initial_batch_size=None):
     logging.info("Using SQLite database at %s", os.path.abspath(DB_FILE))
 
-    # 1️⃣ Generate every combination of the new parameters
-    combos = [
-        (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
-        for resource_type in RESOURCE_TYPES
-        for grade_level in GRADE_LEVELS
-        for subject in SUBJECTS
-        for format_type in FORMATS
-        for price_option in PRICE_OPTIONS
-        for supports in SUPPORTS
-        for sort_order in SORTING_METHODS
-        for page in range(1, TOTAL_PAGES + 1)
-    ]
+    # Initialize adaptive components
+    rate_limiter = AdaptiveRateLimiter(
+        initial_delay=config.get("sleep_between_batches", [0.5, 2.0])[0],
+        max_delay=30.0,
+        error_threshold=0.15
+    )
+    
+    batcher = SmartBatcher(
+        min_batch_size=config.get("min_batch_size", 10),
+        max_batch_size=config.get("max_batch_size", 50),
+        target_time=config.get("target_batch_time", 30.0)
+    )
+    
+    if initial_batch_size:
+        batcher.current_batch_size = initial_batch_size
 
-    # 2️⃣ Load already‑done combos from the DB
+    # 1️⃣ Check for pre-filtered combinations first
+    valid_base_combos = await load_valid_combinations()
+    
+    if valid_base_combos:
+        logging.info(f"Using pre-filtered combinations: {len(valid_base_combos):,}")
+        # Generate combinations from pre-filtered list
+        combos = [
+            (*combo, page)
+            for combo in valid_base_combos
+            for page in range(1, TOTAL_PAGES + 1)
+        ]
+    else:
+        # 2️⃣ Generate all combinations and filter out known empty ones
+        all_base_combos = [
+            (resource_type, grade_level, subject, format_type, price_option, supports, sort_order)
+            for resource_type in RESOURCE_TYPES
+            for grade_level in GRADE_LEVELS
+            for subject in SUBJECTS
+            for format_type in FORMATS
+            for price_option in PRICE_OPTIONS
+            for supports in SUPPORTS
+            for sort_order in SORTING_METHODS
+        ]
+        
+        # Load known empty combinations
+        empty_combos = await get_empty_combinations()
+        logging.info(f"Found {len(empty_combos):,} known empty combinations to skip")
+        
+        # Filter out empty combinations
+        valid_base_combos = [combo for combo in all_base_combos if combo not in empty_combos]
+        filtered_out = len(all_base_combos) - len(valid_base_combos)
+        
+        logging.info(f"Filtered out {filtered_out:,} empty combinations ({filtered_out/len(all_base_combos)*100:.1f}%)")
+        
+        # Generate full combinations with pages
+        combos = [
+            (*combo, page)
+            for combo in valid_base_combos
+            for page in range(1, TOTAL_PAGES + 1)
+        ]
+
+    # 3️⃣ Load already‑done combos from the DB
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("""
             SELECT resource_type, grade_level, subject, format, price_option, supports, sort_order, page 
@@ -297,34 +562,116 @@ async def extraction_stage(batch_size=50):
         """) as cursor:
             done_combos = set(await cursor.fetchall())
 
-    logging.info("Already done combos: %s/%s", len(done_combos), len(combos))
-
-    # 3️⃣ Filter out completed combos
+    # 4️⃣ Filter out completed combos
     remaining = [c for c in combos if c not in done_combos]
-    total_batches = math.ceil(len(remaining) / batch_size)
-    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+    
+    # Enhanced progress display
+    completed_count = len(done_combos)
+    total_count = len(combos)
+    remaining_count = len(remaining)
+    completion_percentage = (completed_count / total_count * 100) if total_count > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print(f"EXTRACTION PROGRESS SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total combinations:     {total_count:,}")
+    print(f"Already completed:      {completed_count:,} ({completion_percentage:.1f}%)")
+    print(f"Remaining to process:   {remaining_count:,}")
+    if remaining_count > 0:
+        estimated_time = remaining_count * 2 / 3600  # Rough estimate: 2 seconds per combination
+        print(f"Estimated time:         {estimated_time:.1f} hours")
+    print(f"{'='*60}\n")
+    
+    if not remaining:
+        logging.info("🎉 All combinations already processed!")
+        return
+    
+    semaphore = asyncio.Semaphore(config.get("concurrent_requests", 25))
 
-    async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
-        for batch_idx in range(total_batches):
-            start, end = batch_idx * batch_size, (batch_idx + 1) * batch_size
+    # Enhanced session configuration with connection pooling
+    connector = aiohttp.TCPConnector(
+        limit=config.get("concurrent_requests", 25) + 10,  # Slightly higher than concurrent requests
+        limit_per_host=config.get("concurrent_requests", 25),
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
+        
+        batch_idx = 0
+        processed = 0
+        
+        while processed < len(remaining):
+            batch_size = batcher.get_next_batch_size()
+            start = processed
+            end = min(processed + batch_size, len(remaining))
             batch = remaining[start:end]
+            
+            logging.info(f"Processing batch {batch_idx + 1} with {len(batch)} items (adaptive batch size: {batch_size})")
+            
+            batch_start_time = time.time()
             tasks = [
                 extract_page_wrapper(session,
                                      build_page_url(resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page),
                                      semaphore,
-                                     resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
+                                     resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page,
+                                     rate_limiter)
                 for resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page in batch
             ]
 
             try:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                batch_duration = time.time() - batch_start_time
+                
+                # Calculate success rate
+                successes = sum(1 for r in results if not isinstance(r, Exception))
+                success_rate = successes / len(results) if results else 0
+                error_rate = 1.0 - success_rate
+                
+                # Record batch performance for adaptive batching
+                batcher.record_batch_performance(batch_size, batch_duration, success_rate)
+                
+                # Record performance stats to database
+                await record_performance_stats("extraction", batch_size, batch_duration, success_rate, error_rate, len(batch))
+                
+                # Enhanced progress logging
+                overall_progress = (processed / len(remaining)) * 100
+                estimated_remaining_time = ((len(remaining) - processed) * batch_duration / len(batch)) / 3600 if len(batch) > 0 else 0
+                
+                logging.info(f"Batch {batch_idx + 1} complete in {batch_duration:.1f}s. Success rate: {success_rate:.2%}")
+                logging.info(f"Progress: {processed:,}/{len(remaining):,} ({overall_progress:.1f}%) | "
+                           f"ETA: {estimated_remaining_time:.1f}h | Batch size: {batch_size}")
+                
             except Exception as e:
-                logging.error("Error processing batch %s: %s", batch_idx, e)
+                logging.error("Error processing batch %s: %s", batch_idx + 1, e)
+                # Record poor performance for this batch
+                batch_duration = time.time() - batch_start_time
+                batcher.record_batch_performance(batch_size, batch_duration, 0.0)
+                await record_performance_stats("extraction", batch_size, batch_duration, 0.0, 1.0, len(batch))
 
-            logging.info("Batch %s/%s complete.", batch_idx + 1, total_batches)
-            await asyncio.sleep(random.uniform(2, 5))
+            processed = end
+            batch_idx += 1
+            
+            # Adaptive sleep between batches
+            if processed < len(remaining):
+                sleep_range = config.get("sleep_between_batches", [0.5, 2.0])
+                sleep_time = random.uniform(sleep_range[0], sleep_range[1])
+                await asyncio.sleep(sleep_time)
 
-    logging.info("Resumed extraction finished; all new pages saved.")
+    logging.info("Adaptive extraction finished; all new pages saved.")
+    logging.info(f"Final batch size: {batcher.current_batch_size}, Final delay: {rate_limiter.current_delay:.2f}s")
+    logging.info(f"Total requests: {rate_limiter.total_count}, Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
+    
+    # Show empty combination stats
+    empty_combos = await get_empty_combinations()
+    logging.info(f"Total empty combinations discovered: {len(empty_combos):,}")
 
 ###########################
 # Extraction Test Stage   #
@@ -336,8 +683,20 @@ async def extraction_test(test_limit=5):
     stores up to test_limit URLs with their parameters in the SQLite database,
     and prints them.
     """
+    # Initialize rate limiter for testing
+    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=10.0)
+    
     extracted_url_details = {}  # dict mapping url -> (resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
-    async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
+    
+    connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
         resource_type = RESOURCE_TYPES[0] if RESOURCE_TYPES else ""
         grade_level = GRADE_LEVELS[0] if GRADE_LEVELS else ""
         subject = SUBJECTS[0] if SUBJECTS else "social-emotional"
@@ -348,7 +707,7 @@ async def extraction_test(test_limit=5):
         page = 1
         page_url = build_page_url(resource_type, grade_level, subject, format_type, price_option, supports, sort_order, page)
         logging.info("Test fetching page: %s", page_url)
-        urls = await extract_urls_from_page(session, page_url)
+        urls = await extract_urls_from_page(session, page_url, rate_limiter)
         for url in urls:
             if len(extracted_url_details) >= test_limit:
                 break
@@ -365,14 +724,19 @@ async def extraction_test(test_limit=5):
     logging.info("Test extracted URLs saved to SQLite database (%s).", DB_FILE)
     for url, params in extracted_url_details.items():
         print(f"{url} -> {params}")
+    
+    # Print rate limiter stats
+    logging.info(f"Rate limiter stats - Final delay: {rate_limiter.current_delay:.2f}s, "
+                f"Total requests: {rate_limiter.total_count}, "
+                f"Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
 
 ###########################
 # Processing Stage        #
 ###########################
 
-async def scrape_product_data(session, url):
+async def scrape_product_data(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None):
     """Scrapes product data from a product URL using BeautifulSoup (lxml parser)."""
-    html = await fetch(session, url)
+    html = await fetch(session, url, rate_limiter)
     if not html:
         return None
     soup = BeautifulSoup(html, "lxml")
@@ -457,14 +821,52 @@ async def scrape_product_data(session, url):
 
     return title, short_description, long_description, rating_value, number_of_ratings, product_price, preview_keywords, url
 
-async def processing_stage(batch_size=50):
+async def processing_stage(initial_batch_size=None):
     url_records = await get_unique_extracted_urls()  # Each record is (url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
     total_records = len(url_records)
     logging.info("Total unique URLs to process: %s", total_records)
 
-    async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
-        for i in range(0, total_records, batch_size):
-            batch = url_records[i:i + batch_size]
+    # Initialize adaptive components
+    rate_limiter = AdaptiveRateLimiter(
+        initial_delay=config.get("download_sleep", [1.0, 3.0])[0],
+        max_delay=30.0,
+        error_threshold=0.15
+    )
+    
+    batcher = SmartBatcher(
+        min_batch_size=config.get("min_batch_size", 10),
+        max_batch_size=config.get("max_batch_size", 50),
+        target_time=config.get("target_batch_time", 45.0)  # Longer target for processing
+    )
+    
+    if initial_batch_size:
+        batcher.current_batch_size = initial_batch_size
+
+    # Enhanced session configuration
+    connector = aiohttp.TCPConnector(
+        limit=config.get("concurrent_requests", 25) + 10,
+        limit_per_host=config.get("concurrent_requests", 25),
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
+        
+        processed = 0
+        batch_idx = 0
+        
+        while processed < total_records:
+            batch_size = batcher.get_next_batch_size()
+            start = processed
+            end = min(processed + batch_size, total_records)
+            batch = url_records[start:end]
             batch_urls = [record[0] for record in batch]
 
             # Pre-check: query the DB for URLs already processed in this batch.
@@ -481,11 +883,47 @@ async def processing_stage(batch_size=50):
             for idx, record in enumerate(batch):
                 url = record[0]
                 if url not in processed_urls:
-                    tasks.append(scrape_product_data(session, url))
+                    tasks.append(scrape_product_data(session, url, rate_limiter))
                     indices_to_process.append(idx)
 
             pre_skipped = len(batch) - len(tasks)  # Count of URLs pre-skipped from the batch.
-            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+            
+            if tasks:
+                logging.info(f"Processing batch {batch_idx + 1} with {len(tasks)} new URLs (batch size: {batch_size}, {pre_skipped} already processed)")
+                batch_start_time = time.time()
+                
+                # Use semaphore to limit concurrent processing requests
+                semaphore = asyncio.Semaphore(config.get("concurrent_requests", 25))
+                
+                async def process_with_sem(task):
+                    async with semaphore:
+                        return await task
+                
+                tasks_with_sem = [process_with_sem(task) for task in tasks]
+                results = await asyncio.gather(*tasks_with_sem, return_exceptions=True)
+                
+                batch_duration = time.time() - batch_start_time
+                
+                # Calculate success rate
+                successes = sum(1 for r in results if r and not isinstance(r, Exception))
+                success_rate = successes / len(results) if results else 0
+                error_rate = 1.0 - success_rate
+                
+                # Record batch performance
+                batcher.record_batch_performance(batch_size, batch_duration, success_rate)
+                
+                # Record performance stats to database
+                await record_performance_stats("processing", batch_size, batch_duration, success_rate, error_rate, len(tasks))
+                
+            else:
+                results = []
+                batch_duration = 0.1
+                success_rate = 1.0  # All were pre-skipped, which is "success"
+                error_rate = 0.0
+                logging.info(f"Batch {batch_idx + 1}: All {len(batch)} URLs already processed")
+                # Record skipped batch stats
+                await record_performance_stats("processing", batch_size, batch_duration, success_rate, error_rate, 0)
+                
             new_count = 0
             skipped_count = pre_skipped  # Start with pre-skipped URLs as skipped.
 
@@ -522,22 +960,23 @@ async def processing_stage(batch_size=50):
                         skipped_count += 1
                 await db.commit()
 
-            batch_complete = i + len(batch)
-            percent_complete = (batch_complete / total_records) * 100
+            processed = end
+            batch_idx += 1
+            percent_complete = (processed / total_records) * 100
             logging.info(
-                "Processed batch %s (%s to %s): %s new, %s skipped. %.2f%% complete.",
-                (i // batch_size) + 1,
-                i + 1,
-                i + len(batch),
-                new_count,
-                skipped_count,
-                percent_complete
+                f"Batch {batch_idx} complete in {batch_duration:.1f}s: {new_count} new, {skipped_count} skipped. "
+                f"Success rate: {success_rate:.2%}. {processed}/{total_records} ({percent_complete:.2f}%) complete."
             )
 
-            # Only sleep if there was any new data inserted.
-            if new_count > 0:
-                await asyncio.sleep(random.uniform(5, 10))
-    logging.info("Finished processing unique URLs.")
+            # Adaptive sleep between batches if there was new data
+            if new_count > 0 and processed < total_records:
+                sleep_range = config.get("download_sleep", [1.0, 3.0])
+                sleep_time = random.uniform(sleep_range[0], sleep_range[1])
+                await asyncio.sleep(sleep_time)
+                
+    logging.info("Finished processing unique URLs with adaptive optimizations.")
+    logging.info(f"Final batch size: {batcher.current_batch_size}, Final delay: {rate_limiter.current_delay:.2f}s")
+    logging.info(f"Total requests: {rate_limiter.total_count}, Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
 
 #############################
 # Free File Download Stage  #
@@ -740,15 +1179,38 @@ async def backfill_preview_keywords(batch_size=50, concurrency=20):
 
     logging.info(f"Backfilling preview_keywords for {len(rows)} records.")
 
+    # Initialize rate limiter for backfill
+    rate_limiter = AdaptiveRateLimiter(
+        initial_delay=1.0,
+        max_delay=15.0,
+        error_threshold=0.1
+    )
+
     total = len(rows)
     sem = asyncio.Semaphore(concurrency)
-    async with aiohttp_client_cache.CachedSession(cache_name="aiohttp_cache", expire_after=3600) as session:
+    
+    # Enhanced session configuration
+    connector = aiohttp.TCPConnector(
+        limit=concurrency + 5,
+        limit_per_host=concurrency,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
         async with aiosqlite.connect(DB_FILE) as db:  # Reuse connection
             for i in range(0, total, batch_size):
                 batch = rows[i:i+batch_size]
                 async def scrape_with_sem(url):
                     async with sem:
-                        return await scrape_product_data(session, url)
+                        return await scrape_product_data(session, url, rate_limiter)
                 tasks = [scrape_with_sem(url) for _, url in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 updates = []
@@ -769,6 +1231,75 @@ async def backfill_preview_keywords(batch_size=50, concurrency=20):
                 logging.info(f"Updated {len(updates)} records in batch {i//batch_size+1}. {completed}/{total} ({percent:.2f}%%) complete.")
 
     logging.info("Backfill of preview_keywords complete.")
+    logging.info(f"Rate limiter stats - Final delay: {rate_limiter.current_delay:.2f}s, "
+                f"Total requests: {rate_limiter.total_count}, "
+                f"Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
+
+###########################
+# Performance Tracking    #
+###########################
+
+async def record_performance_stats(stage: str, batch_size: int, duration: float, success_rate: float, error_rate: float, items_processed: int):
+    """Record performance statistics to the database for monitoring and optimization."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO performance_stats (stage, batch_size, duration, success_rate, error_rate, items_processed)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (stage, batch_size, duration, success_rate, error_rate, items_processed))
+        await db.commit()
+
+async def get_performance_summary(stage: str = None, limit: int = 100) -> list:
+    """Get recent performance statistics for analysis."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        if stage:
+            query = """
+                SELECT timestamp, stage, batch_size, duration, success_rate, error_rate, items_processed
+                FROM performance_stats 
+                WHERE stage = ?
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """
+            params = (stage, limit)
+        else:
+            query = """
+                SELECT timestamp, stage, batch_size, duration, success_rate, error_rate, items_processed
+                FROM performance_stats 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """
+            params = (limit,)
+            
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+async def show_performance_stats(stage: str = None, limit: int = 20):
+    """Display performance statistics."""
+    stats = await get_performance_summary(stage, limit)
+    
+    if not stats:
+        print("No performance statistics available.")
+        return
+        
+    print(f"\n{'='*80}")
+    print(f"PERFORMANCE STATISTICS{f' - {stage.upper()}' if stage else ''}")
+    print(f"{'='*80}")
+    print(f"{'Timestamp':<20} {'Stage':<12} {'Batch':<6} {'Duration':<8} {'Success':<8} {'Error':<8} {'Items':<6}")
+    print(f"{'-'*80}")
+    
+    for stat in stats:
+        timestamp, stage_name, batch_size, duration, success_rate, error_rate, items = stat
+        print(f"{timestamp[:19]:<20} {stage_name:<12} {batch_size:<6} {duration:<8.1f} {success_rate:<8.1%} {error_rate:<8.1%} {items:<6}")
+    
+    # Calculate averages
+    if stats:
+        avg_duration = sum(s[3] for s in stats) / len(stats)
+        avg_success = sum(s[4] for s in stats) / len(stats)
+        avg_error = sum(s[5] for s in stats) / len(stats)
+        total_items = sum(s[6] for s in stats)
+        
+        print(f"{'-'*80}")
+        print(f"{'AVERAGES':<20} {'':<12} {'':<6} {avg_duration:<8.1f} {avg_success:<8.1%} {avg_error:<8.1%} {total_items:<6}")
+        print(f"{'='*80}\n")
 
 ###########################
 # Main Entry Point        #
@@ -776,7 +1307,7 @@ async def backfill_preview_keywords(batch_size=50, concurrency=20):
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="TPT Scraper Tool: Extract, process, and download TPT product data."
+        description="TPT Scraper Tool: Extract, process, and download TPT product data with adaptive performance optimization."
     )
     subparsers = parser.add_subparsers(dest="stage", required=True, help="Stage to run")
 
@@ -784,10 +1315,12 @@ async def main():
     subparsers.add_parser("test", help="Test extraction on a single page.")
 
     # Extract stage
-    subparsers.add_parser("extract", help="Extract product URLs for all config combinations.")
+    extract_parser = subparsers.add_parser("extract", help="Extract product URLs for all config combinations.")
+    extract_parser.add_argument("--batch-size", type=int, help="Initial batch size (will be optimized adaptively)")
 
     # Process stage
-    subparsers.add_parser("process", help="Process and scrape product data for extracted URLs.")
+    process_parser = subparsers.add_parser("process", help="Process and scrape product data for extracted URLs.")
+    process_parser.add_argument("--batch-size", type=int, help="Initial batch size (will be optimized adaptively)")
 
     # Download stage
     download_parser = subparsers.add_parser("download", help="Download free files for eligible products.")
@@ -795,6 +1328,11 @@ async def main():
 
     # Update stage
     subparsers.add_parser("update", help="Update config metadata for product data.")
+
+    # Performance stats stage
+    stats_parser = subparsers.add_parser("stats", help="Show performance statistics.")
+    stats_parser.add_argument("--filter-stage", choices=["extraction", "processing"], help="Filter by stage")
+    stats_parser.add_argument("--limit", type=int, default=20, help="Number of recent records to show")
 
     # Backfill preview_keywords (as a separate flag, not a stage)
     parser.add_argument(
@@ -814,14 +1352,21 @@ async def main():
     if args.stage == "test":
         await extraction_test()
     elif args.stage == "extract":
-        await extraction_stage()
+        batch_size = getattr(args, "batch_size", None)
+        await extraction_stage(batch_size)
     elif args.stage == "process":
-        await processing_stage()
+        batch_size = getattr(args, "batch_size", None)
+        await processing_stage(batch_size)
     elif args.stage == "download":
         await processing_free_download_stage(dry_run=getattr(args, "dry_run", False))
     elif args.stage == "update":
         await update_config_metadata()
         await check_config_metadata()
+    elif args.stage == "stats":
+        await show_performance_stats(
+            stage=getattr(args, "filter_stage", None),
+            limit=getattr(args, "limit", 20)
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
