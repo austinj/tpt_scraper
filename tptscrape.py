@@ -736,6 +736,23 @@ async def extraction_test(test_limit=5):
 # Processing Stage        #
 ###########################
 
+def extract_text_with_spacing(element):
+    """
+    Extract text from BeautifulSoup element while preserving proper spacing.
+    This prevents the missing space issue that occurs with get_text(strip=True).
+    """
+    if not element:
+        return None
+    
+    # Use separator=' ' to ensure spaces between elements, then clean up
+    text = element.get_text(separator=' ')
+    
+    # Clean up multiple spaces and strip
+    import re
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text if text else None
+
 async def scrape_product_data(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None):
     """Scrapes product data from a product URL using BeautifulSoup (lxml parser)."""
     html = await fetch(session, url, rate_limiter)
@@ -746,7 +763,7 @@ async def scrape_product_data(session, url, rate_limiter: Optional[AdaptiveRateL
     meta_desc = soup.find("meta", {"name": "description"})
     short_description = meta_desc["content"] if meta_desc and meta_desc.has_attr("content") else None
     long_desc_elem = soup.find(class_="ProductDescriptionLayout__htmlDisplay")
-    long_description = long_desc_elem.get_text(strip=True) if long_desc_elem else None
+    long_description = extract_text_with_spacing(long_desc_elem) if long_desc_elem else None
     rating_value = None
     number_of_ratings = None
     rating_elem = soup.select_one("span.StarRating-module__srOnly--FAzEA")
@@ -1238,6 +1255,201 @@ async def backfill_preview_keywords(batch_size=50, concurrency=20):
                 f"Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
 
 ###########################
+# Backfill Long Descriptions Stage
+###########################
+
+async def backfill_long_descriptions(limit=None, batch_size=50, concurrency=10):
+    """
+    Optimized backfill of long_description fields with corrected text extraction.
+    This will re-scrape and update records that have spacing issues.
+    
+    Args:
+        limit: Maximum number of products to process (for testing)
+        batch_size: Number of products to process in each batch
+        concurrency: Number of concurrent HTTP requests
+    """
+    print("=" * 80)
+    print("BACKFILLING LONG DESCRIPTIONS WITH CORRECTED EXTRACTION (OPTIMIZED)")
+    print("=" * 80)
+    
+    # Get all products that have long descriptions (to re-process)
+    query = """
+        SELECT id, url, long_description FROM product_data 
+        WHERE long_description IS NOT NULL 
+        AND long_description != ''
+        ORDER BY id
+    """
+    if limit:
+        query += f" LIMIT {limit}"
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(query) as cursor:
+            products = await cursor.fetchall()
+    
+    if not products:
+        print("No products found with long descriptions to backfill.")
+        return
+    
+    print(f"Found {len(products)} products with long descriptions to potentially update.")
+    if limit:
+        print(f"(Limited to {limit} products for testing)")
+    print(f"Using batch size: {batch_size}, concurrency: {concurrency}")
+    print("This will re-scrape and update records with corrected text extraction.")
+    
+    # Ask for confirmation
+    response = input("\nDo you want to proceed with backfilling? (y/N): ").strip().lower()
+    if response not in ['y', 'yes']:
+        print("Backfill cancelled.")
+        return
+    
+    # Initialize adaptive components
+    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=10.0, error_threshold=0.15)
+    
+    # Enhanced session configuration
+    connector = aiohttp.TCPConnector(
+        limit=concurrency + 5,
+        limit_per_host=concurrency,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    total_updated = 0
+    total_errors = 0
+    total_unchanged = 0
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
+        
+        # Process in batches for better performance
+        for batch_idx in range(0, len(products), batch_size):
+            batch = products[batch_idx:batch_idx + batch_size]
+            batch_start_time = time.time()
+            
+            print(f"\nProcessing batch {batch_idx//batch_size + 1}/{(len(products) + batch_size - 1)//batch_size}")
+            print(f"Products {batch_idx + 1}-{min(batch_idx + batch_size, len(products))} of {len(products)}")
+            
+            # Create semaphore for this batch
+            semaphore = asyncio.Semaphore(concurrency)
+            
+            async def process_product(product_data):
+                product_id, url, current_description = product_data
+                
+                async with semaphore:
+                    try:
+                        await rate_limiter.wait()
+                        
+                        html = await fetch(session, url, rate_limiter)
+                        if not html:
+                            return product_id, "fetch_failed", None, None
+                        
+                        soup = BeautifulSoup(html, "lxml")
+                        long_desc_elem = soup.find(class_="ProductDescriptionLayout__htmlDisplay")
+                        
+                        if not long_desc_elem:
+                            return product_id, "element_not_found", None, None
+                        
+                        # Use our new extraction method
+                        new_long_description = extract_text_with_spacing(long_desc_elem)
+                        
+                        if not new_long_description:
+                            return product_id, "no_text_extracted", None, None
+                        
+                        # Compare with current description
+                        if current_description and current_description.strip() == new_long_description.strip():
+                            return product_id, "no_change", current_description, new_long_description
+                        
+                        length_diff = len(new_long_description) - len(current_description) if current_description else len(new_long_description)
+                        return product_id, "updated", current_description, new_long_description, length_diff
+                        
+                    except Exception as e:
+                        return product_id, "error", None, None, str(e)
+            
+            # Process batch concurrently
+            tasks = [process_product(product_data) for product_data in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Collect updates for batch database write
+            updates = []
+            batch_updated = 0
+            batch_errors = 0
+            batch_unchanged = 0
+            
+            for result in results:
+                if isinstance(result, Exception):
+                    batch_errors += 1
+                    continue
+                    
+                if len(result) >= 4:  # Successful processing
+                    product_id, status, old_desc, new_desc = result[:4]
+                    
+                    if status == "updated":
+                        updates.append((new_desc, product_id))
+                        batch_updated += 1
+                        length_diff = result[4] if len(result) > 4 else 0
+                        print(f"  📝 Product {product_id}: +{length_diff} chars")
+                    elif status == "no_change":
+                        batch_unchanged += 1
+                    elif status in ["fetch_failed", "element_not_found", "no_text_extracted"]:
+                        batch_errors += 1
+                        print(f"  ⚠️  Product {product_id}: {status}")
+                    elif status == "error":
+                        batch_errors += 1
+                        error_msg = result[4] if len(result) > 4 else "Unknown error"
+                        print(f"  ❌ Product {product_id}: {error_msg}")
+            
+            # Batch database update
+            if updates:
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.executemany(
+                        "UPDATE product_data SET long_description = ? WHERE id = ?",
+                        updates
+                    )
+                    await db.commit()
+            
+            # Update totals
+            total_updated += batch_updated
+            total_errors += batch_errors
+            total_unchanged += batch_unchanged
+            
+            # Batch summary
+            batch_duration = time.time() - batch_start_time
+            success_rate = (batch_updated + batch_unchanged) / len(batch) if len(batch) > 0 else 0
+            
+            print(f"  Batch complete in {batch_duration:.1f}s: {batch_updated} updated, {batch_unchanged} unchanged, {batch_errors} errors")
+            print(f"  Success rate: {success_rate:.1%} | Overall progress: {min(batch_idx + batch_size, len(products))}/{len(products)}")
+            
+            # Small delay between batches
+            if batch_idx + batch_size < len(products):
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+    
+    print("\n" + "=" * 80)
+    print("OPTIMIZED BACKFILL SUMMARY")
+    print("=" * 80)
+    print(f"Total products processed: {len(products)}")
+    print(f"Successfully updated: {total_updated}")
+    print(f"No changes needed: {total_unchanged}")
+    print(f"Errors encountered: {total_errors}")
+    print(f"Overall success rate: {(total_updated + total_unchanged)/len(products):.1%}")
+    
+    if total_updated > 0:
+        print(f"\n✅ Successfully backfilled {total_updated} long descriptions!")
+        print("The spacing issues in your database should now be resolved.")
+    else:
+        print("\n⚠️  No records were updated. This could mean:")
+        print("   - All records already have correct spacing")
+        print("   - The extraction method found the same text")
+        print("   - There were errors accessing the products")
+    
+    # Final rate limiter stats
+    print(f"\nRate limiter stats - Final delay: {rate_limiter.current_delay:.2f}s")
+    print(f"Total requests: {rate_limiter.total_count}, Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
+
+###########################
 # Performance Tracking    #
 ###########################
 
@@ -1304,6 +1516,132 @@ async def show_performance_stats(stage: str = None, limit: int = 20):
         print(f"{'='*80}\n")
 
 ###########################
+# Test Extraction Function #
+###########################
+
+async def test_extraction_function():
+    """
+    Test the new extract_text_with_spacing function on the known problematic product (id 15).
+    Compare the old method (get_text(strip=True)) vs new method (extract_text_with_spacing).
+    """
+    test_url = "https://www.teacherspayteachers.com/Product/1st-Grade-Math-Games-1st-Grade-ELA-Games-1st-Grade-Knockout-BUNDLE-3110453"
+    
+    logging.info(f"Testing extraction methods on: {test_url}")
+    
+    # Initialize rate limiter for testing
+    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=10.0)
+    
+    connector = aiohttp.TCPConnector(limit=5, keepalive_timeout=30)
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
+        
+        html = await fetch(session, test_url, rate_limiter)
+        if not html:
+            logging.error("Failed to fetch the test URL")
+            return
+            
+        soup = BeautifulSoup(html, "lxml")
+        long_desc_elem = soup.find(class_="ProductDescriptionLayout__htmlDisplay")
+        
+        if not long_desc_elem:
+            logging.error("Could not find long description element")
+            return
+            
+        # Test old method (problematic)
+        old_method_text = long_desc_elem.get_text(strip=True) if long_desc_elem else None
+        
+        # Test new method (fixed)
+        new_method_text = extract_text_with_spacing(long_desc_elem)
+        
+        print("\n" + "="*80)
+        print("EXTRACTION METHOD COMPARISON TEST")
+        print("="*80)
+        print(f"URL: {test_url}")
+        print(f"Element found: {long_desc_elem is not None}")
+        print()
+        
+        print("OLD METHOD (get_text(strip=True)) - PROBLEMATIC:")
+        print("-" * 50)
+        if old_method_text:
+            print(f"Length: {len(old_method_text)} characters")
+            print(f"First 200 chars: {old_method_text[:200]}...")
+            # Look for missing spaces indicator
+            missing_spaces_indicators = [
+                "mathandlanguage", "mathmath", "languagelanguage", 
+                "andthe", "thethe", "forand", "withthe"
+            ]
+            found_issues = [indicator for indicator in missing_spaces_indicators if indicator in old_method_text.lower()]
+            if found_issues:
+                print(f"⚠️  Found spacing issues: {found_issues}")
+            else:
+                print("✅ No obvious spacing issues detected")
+        else:
+            print("❌ No text extracted")
+        
+        print()
+        print("NEW METHOD (extract_text_with_spacing) - FIXED:")
+        print("-" * 50)
+        if new_method_text:
+            print(f"Length: {len(new_method_text)} characters")
+            print(f"First 200 chars: {new_method_text[:200]}...")
+            # Check for proper spacing
+            if " and " in new_method_text and " the " in new_method_text:
+                print("✅ Proper spacing detected (contains ' and ', ' the ')")
+            else:
+                print("⚠️  May still have spacing issues")
+        else:
+            print("❌ No text extracted")
+        
+        print()
+        print("COMPARISON:")
+        print("-" * 50)
+        if old_method_text and new_method_text:
+            length_diff = len(new_method_text) - len(old_method_text)
+            print(f"Length difference: {length_diff} characters")
+            if length_diff > 0:
+                print("✅ New method extracted more text (likely due to preserved spaces)")
+            elif length_diff == 0:
+                print("⚠️  Same length - methods may be equivalent for this page")
+            else:
+                print("❌ New method extracted less text")
+                
+            # Check if they're the same
+            if old_method_text.strip() == new_method_text.strip():
+                print("⚠️  Extracted text is identical - this page may not demonstrate the issue")
+            else:
+                print("✅ Extracted text differs - new method is working differently")
+        
+        print("="*80)
+        
+        # Also check what's currently in the database for comparison
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT long_description FROM product_data WHERE id = 15"
+            ) as cursor:
+                db_result = await cursor.fetchone()
+                
+        if db_result and db_result[0]:
+            print("\nCURRENT DATABASE VALUE:")
+            print("-" * 50)
+            db_text = db_result[0]
+            print(f"Length: {len(db_text)} characters")
+            print(f"First 200 chars: {db_text[:200]}...")
+            if old_method_text and db_text.strip() == old_method_text.strip():
+                print("✅ Database matches old method (confirms this is the source of the issue)")
+            else:
+                print("⚠️  Database doesn't match old method")
+        else:
+            print("\n❌ No data found in database for id 15")
+    
+    return True
+
+###########################
 # Main Entry Point        #
 ###########################
 
@@ -1315,6 +1653,15 @@ async def main():
 
     # Test stage
     subparsers.add_parser("test", help="Test extraction on a single page.")
+    
+    # Test extraction methods stage
+    subparsers.add_parser("test-extraction", help="Test the new extraction method on the known problematic product.")
+    
+    # Backfill long descriptions stage
+    backfill_parser = subparsers.add_parser("backfill-descriptions", help="Backfill existing long_description records with corrected text extraction.")
+    backfill_parser.add_argument("--limit", type=int, help="Limit the number of products to process (for testing)")
+    backfill_parser.add_argument("--batch-size", type=int, default=50, help="Number of products to process in each batch (default: 50)")
+    backfill_parser.add_argument("--concurrency", type=int, default=10, help="Number of concurrent HTTP requests (default: 10)")
 
     # Extract stage
     extract_parser = subparsers.add_parser("extract", help="Extract product URLs for all config combinations. Automatically starts processing when complete.")
@@ -1357,6 +1704,13 @@ async def main():
 
     if args.stage == "test":
         await extraction_test()
+    elif args.stage == "test-extraction":
+        await test_extraction_function()
+    elif args.stage == "backfill-descriptions":
+        limit = getattr(args, "limit", None)
+        batch_size = getattr(args, "batch_size", 50)
+        concurrency = getattr(args, "concurrency", 10)
+        await backfill_long_descriptions(limit, batch_size, concurrency)
     elif args.stage == "extract" or args.stage == "full":
         batch_size = getattr(args, "batch_size", None)
         success = await extraction_stage(batch_size)
