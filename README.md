@@ -57,19 +57,23 @@ Edit `config.json` to customize scraping parameters:
 ### Basic Usage
 
 ```bash
-# Run extraction stage (discover URLs)
+# Run complete pipeline (extraction + processing) - RECOMMENDED for unattended operation
 python tptscrape.py extract
 
-# Run scraping stage (get product details)
-python tptscrape.py scrape
+# Run complete pipeline explicitly
+python tptscrape.py full
 
-# Run both stages
-python tptscrape.py extract-and-scrape
+# Run only processing stage (scrape product details from already extracted URLs)
+python tptscrape.py process
 
-# Test with limited results
-python tptscrape.py extract-test
-python tptscrape.py scrape-test
+# Test extraction on a single page
+python tptscrape.py test
+
+# View performance statistics
+python tptscrape.py stats
 ```
+
+**Note**: The `extract` command now automatically starts processing when extraction completes, providing a fully unattended workflow. This means you can start the scraper and walk away - it will complete both phases automatically.
 
 ### Optimization Workflow
 
@@ -174,16 +178,16 @@ The scraper provides comprehensive monitoring:
 
 ### Small to Medium Scale (< 10K combinations)
 ```bash
-python tptscrape.py extract-and-scrape
-python monitor.py report
+python tptscrape.py extract
+python tptscrape.py stats
 ```
 
 ### Large Scale (10K-100K combinations)
 ```bash
 python optimize.py analyze
 python optimize.py sample
-python tptscrape.py extract-and-scrape
-python monitor.py report
+python tptscrape.py extract
+python tptscrape.py stats
 ```
 
 ### Very Large Scale (100K+ combinations)
@@ -191,8 +195,8 @@ python monitor.py report
 python optimize.py analyze
 python optimize.py sample --samples 10000
 python optimize.py prefilter  # May take hours
-python tptscrape.py extract-and-scrape
-python monitor.py plot
+python tptscrape.py extract
+python tptscrape.py stats
 ```
 
 ## 🛡️ Error Handling

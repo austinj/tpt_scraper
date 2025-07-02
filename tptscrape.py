@@ -672,6 +672,8 @@ async def extraction_stage(initial_batch_size=None):
     # Show empty combination stats
     empty_combos = await get_empty_combinations()
     logging.info(f"Total empty combinations discovered: {len(empty_combos):,}")
+    
+    return True  # Indicate successful completion
 
 ###########################
 # Extraction Test Stage   #
@@ -1315,12 +1317,16 @@ async def main():
     subparsers.add_parser("test", help="Test extraction on a single page.")
 
     # Extract stage
-    extract_parser = subparsers.add_parser("extract", help="Extract product URLs for all config combinations.")
+    extract_parser = subparsers.add_parser("extract", help="Extract product URLs for all config combinations. Automatically starts processing when complete.")
     extract_parser.add_argument("--batch-size", type=int, help="Initial batch size (will be optimized adaptively)")
 
     # Process stage
     process_parser = subparsers.add_parser("process", help="Process and scrape product data for extracted URLs.")
     process_parser.add_argument("--batch-size", type=int, help="Initial batch size (will be optimized adaptively)")
+    
+    # Full pipeline stage
+    full_parser = subparsers.add_parser("full", help="Run complete extraction + processing pipeline (same as 'extract' but more explicit).")
+    full_parser.add_argument("--batch-size", type=int, help="Initial batch size (will be optimized adaptively)")
 
     # Download stage
     download_parser = subparsers.add_parser("download", help="Download free files for eligible products.")
@@ -1351,9 +1357,29 @@ async def main():
 
     if args.stage == "test":
         await extraction_test()
-    elif args.stage == "extract":
+    elif args.stage == "extract" or args.stage == "full":
         batch_size = getattr(args, "batch_size", None)
-        await extraction_stage(batch_size)
+        success = await extraction_stage(batch_size)
+        
+        if success:
+            logging.info("=" * 60)
+            logging.info("EXTRACTION PHASE COMPLETED SUCCESSFULLY")
+            logging.info("=" * 60)
+            logging.info("Automatically starting processing phase...")
+            
+            # Start processing automatically
+            try:
+                await processing_stage(batch_size)
+                logging.info("=" * 60)
+                logging.info("FULL PIPELINE COMPLETED SUCCESSFULLY")
+                logging.info("Extract → Process pipeline finished successfully!")
+                logging.info("Your data is ready for analysis.")
+                logging.info("=" * 60)
+            except Exception as e:
+                logging.error(f"Error during automatic processing: {e}")
+                logging.error("You can manually run processing with: python tptscrape.py process")
+        else:
+            logging.error("Extraction phase failed - processing will not start automatically")
     elif args.stage == "process":
         batch_size = getattr(args, "batch_size", None)
         await processing_stage(batch_size)
