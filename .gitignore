@@ -1,6 +1,6 @@
 # Custom
 output/
-scrape_cache.db*
+scrape_cache*
 sqlite3.exe
 free_product_export/
 tpt_storage.json

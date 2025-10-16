@@ -53,7 +53,7 @@
         "Price-Desc",
         "Most-Recent"
     ],
-    "total_pages": 20,
+    "total_pages": 42,
     "concurrent_requests": 25,
     "max_retries": 2,
     "sleep_between_batches": [0.5, 2.0],

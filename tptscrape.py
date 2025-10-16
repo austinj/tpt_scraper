@@ -554,6 +554,14 @@ async def extraction_stage(initial_batch_size=None):
             for page in range(1, TOTAL_PAGES + 1)
         ]
 
+        # Add debugging logging
+        logging.info(f"Generated {len(combos)} total combinations")
+        logging.info(f"TOTAL_PAGES from config: {TOTAL_PAGES}")
+        
+        # Sample a few combinations to verify structure
+        sample_combos = combos[:5] + combos[-5:] if len(combos) > 10 else combos
+        logging.info(f"Sample combinations: {sample_combos}")
+
     # 3️⃣ Load already‑done combos from the DB
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute("""
@@ -613,6 +621,12 @@ async def extraction_stage(initial_batch_size=None):
             start = processed
             end = min(processed + batch_size, len(remaining))
             batch = remaining[start:end]
+            
+            # Add batch debugging logging
+            if batch:
+                first_combo = batch[0]
+                last_combo = batch[-1]
+                logging.info(f"Batch {batch_idx + 1}: Processing from {first_combo} to {last_combo}")
             
             logging.info(f"Processing batch {batch_idx + 1} with {len(batch)} items (adaptive batch size: {batch_size})")
             
