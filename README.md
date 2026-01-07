@@ -1,249 +1,294 @@
-# TPT Scraper - Advanced Web Scraping Tool
+# TPT Scraper - Refactored Version
 
-A highly optimized, scalable web scraper for Teachers Pay Teachers (TPT) that efficiently extracts product URLs and detailed product information. Features advanced optimization capabilities for handling large-scale scraping operations with millions of filter combinations.
+A clean, workflow-based scraper for Teachers Pay Teachers with support for multiple named configurations.
 
-## 🚀 Key Features
+## ✨ Key Improvements
 
-### Core Functionality
-- **URL Extraction**: Efficiently discovers product URLs across all TPT categories and filters
-- **Product Scraping**: Extracts comprehensive product data including titles, descriptions, ratings, and prices
-- **Robust Database Storage**: SQLite database with optimized schema for fast queries and data integrity
+### Clear Workflow Separation
+- **Search**: Find product URLs matching your criteria
+- **Scrape**: Extract metadata for discovered products  
+- **Download**: Download free product files
 
-### Advanced Optimizations
-- **Empty Combination Detection**: Automatically identifies and skips filter combinations that yield no results
-- **Pre-filtering Support**: Generates and uses pre-filtered lists of valid combinations to maximize efficiency
-- **Adaptive Performance**: Dynamic rate limiting and batch size adjustment based on real-time performance
-- **Statistical Sampling**: Quick estimation of empty combination percentages for large config spaces
-- **Comprehensive Monitoring**: Performance tracking, efficiency analysis, and optimization recommendations
+### Named Configurations
+- Create multiple configurations for different searches
+- Each configuration has its own isolated database
+- Easy to manage and switch between different search strategies
 
-### Scalability Features
-- **Asynchronous Processing**: High-performance async/await pattern with configurable concurrency
-- **Smart Caching**: HTTP response caching to minimize redundant requests
-- **Database Optimizations**: Efficient indexing, batch operations, and connection pooling
-- **Memory Management**: Optimized memory usage for processing millions of combinations
+### Better Data Organization
+- Separate databases per configuration
+- Clear separation of search results, metadata, and downloads
+- Easy to export and analyze specific searches
 
-## 📦 Installation
+## 🚀 Quick Start
+
+### 1. Create a Configuration
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd tpt_scraper
+# Create from existing config.json
+python tpt_scraper_refactored.py config create my-search --template config.json --description "Social emotional learning resources"
 
-# Install dependencies
-pip install -r requirements.txt
+# Or create a minimal config (you can edit configs/my-search.json later)
+python tpt_scraper_refactored.py config create test-search --description "Test configuration"
 ```
 
-## 🛠️ Configuration
+### 2. Run the Three Workflows
 
-Edit `config.json` to customize scraping parameters:
+```bash
+# Step 1: Search for product URLs
+python tpt_scraper_refactored.py search my-search
+
+# Step 2: Scrape metadata for found products
+python tpt_scraper_refactored.py scrape my-search
+
+# Step 3: Download free products
+python tpt_scraper_refactored.py download my-search
+```
+
+### 3. View Statistics
+
+```bash
+python tpt_scraper_refactored.py stats my-search
+```
+
+## 📋 Configuration Management
+
+### List All Configurations
+
+```bash
+python tpt_scraper_refactored.py config list
+```
+
+### Edit a Configuration
+
+Configurations are stored as JSON files in the `configs/` directory:
+
+```bash
+# Edit the configuration file directly
+notepad configs/my-search.json
+```
+
+### Configuration File Format
 
 ```json
 {
-    "resource_types": ["", "activities", "assessments"],
-    "grade_levels": ["", "kindergarten", "1st", "2nd"],
-    "subjects": ["math", "science", "social-studies"],
-    "formats": ["", "pdf", "powerpoint"],
-    "price_options": ["", "free", "paid"],
-    "supports": ["", "easel-activity"],
-    "sorting_methods": ["Relevance", "Price: Low to High"],
-    "total_pages": 42,
-    "concurrent_requests": 25,
-    "sleep_between_batches": [0.5, 2.0]
+  "resource_type": ["teacher-tools"],
+  "grade_level": ["elementary", "middle-school"],
+  "subject": ["social-emotional/classroom-management"],
+  "format": ["pdf"],
+  "price_options": ["free"],
+  "supports": [""],
+  "sorting_methods": ["Relevance", "Rating"],
+  "total_pages": 20,
+  "concurrent_requests": 25
 }
 ```
 
-## 🔧 Usage
+## 🎯 Workflows
 
-### Basic Usage
+### 1. Search Workflow
 
-```bash
-# Run complete pipeline (extraction + processing) - RECOMMENDED for unattended operation
-python tptscrape.py extract
-
-# Run complete pipeline explicitly
-python tptscrape.py full
-
-# Run only processing stage (scrape product details from already extracted URLs)
-python tptscrape.py process
-
-# Test extraction on a single page
-python tptscrape.py test
-
-# View performance statistics
-python tptscrape.py stats
-```
-
-**Note**: The `extract` command now automatically starts processing when extraction completes, providing a fully unattended workflow. This means you can start the scraper and walk away - it will complete both phases automatically.
-
-### Optimization Workflow
-
-For large-scale operations with many filter combinations:
+Discovers product URLs based on your configuration parameters.
 
 ```bash
-# 1. Analyze your configuration
-python optimize.py analyze
-
-# 2. Run statistical sampling to estimate efficiency gains
-python optimize.py sample --samples 5000
-
-# 3. Generate pre-filtered combinations (for very large configs)
-python optimize.py prefilter
-
-# 4. Run complete optimization workflow
-python optimize.py all
+python tpt_scraper_refactored.py search <config-name>
 ```
 
-### Performance Monitoring
+**What it does:**
+- Generates all combinations of your search parameters
+- Fetches search result pages from TPT
+- Extracts product URLs
+- Stores URLs in `scrape_cache_<config-name>.db`
+- Tracks which combinations have been searched (resumable)
+
+**Output:** `search_results` table with all discovered URLs
+
+### 2. Scrape Metadata Workflow
+
+Extracts detailed information from product pages.
 
 ```bash
-# Generate performance report
-python monitor.py report
-
-# Create performance trend plots
-python monitor.py plot
-
-# Real-time monitoring
-python monitor.py watch
+python tpt_scraper_refactored.py scrape <config-name>
 ```
 
-## 📊 Optimization Tools
+**What it does:**
+- Gets all URLs from search results that haven't been scraped
+- Scrapes each product page for metadata
+- Stores title, descriptions, ratings, price, keywords
 
-### Statistical Sampling (`sample_combinations.py`)
-Quickly estimates the percentage of empty filter combinations without full processing:
-- Tests a random sample of combinations
-- Provides statistical estimates with confidence intervals
-- Helps decide if pre-filtering is worthwhile
+**Output:** `product_metadata` table with product details
 
-### Pre-filtering (`filter_combinations.py`)
-Generates a comprehensive list of valid (non-empty) combinations:
-- Tests all possible filter combinations
-- Creates `valid_combinations.json` for the main scraper
-- Generates `config_filtered.json` with only valid options
+### 3. Download Free Files Workflow
 
-### Performance Monitor (`monitor.py`)
-Tracks scraper performance and provides optimization insights:
-- Real-time performance metrics
-- Empty combination efficiency analysis
-- Trend visualization and recommendations
+Downloads actual product files for free resources.
 
-### CLI Optimizer (`optimize.py`)
-Unified interface for all optimization tools:
-- Configuration analysis
-- Automated optimization workflows
-- Status checking and recommendations
-
-## 🏗️ Database Schema
-
-```sql
--- URL extraction tracking
-CREATE TABLE extracted_pages (...)
-CREATE TABLE extracted_urls (...)
-
--- Product data storage  
-CREATE TABLE scraped_data (...)
-
--- Optimization tables
-CREATE TABLE empty_combinations (...)
-CREATE TABLE performance_stats (...)
-```
-
-## ⚡ Performance Features
-
-### Adaptive Rate Limiting
-- Automatically adjusts request delays based on success rates
-- Prevents overwhelming the target server
-- Maintains optimal throughput
-
-### Smart Batching
-- Dynamic batch size adjustment based on performance
-- Optimizes memory usage and processing speed
-- Adapts to network conditions
-
-### Empty Combination Skipping
-- Tracks combinations that yield no results
-- Skips known empty combinations in future runs
-- Can save 20-80% of requests for large configurations
-
-## 📈 Monitoring and Analytics
-
-The scraper provides comprehensive monitoring:
-
-- **Success/Error Rates**: Track request reliability
-- **Processing Speed**: Monitor items processed per second
-- **Empty Combination Stats**: Efficiency metrics and savings
-- **Database Growth**: Track data collection progress
-- **Performance Trends**: Historical analysis and visualization
-
-## 🔍 Example Workflows
-
-### Small to Medium Scale (< 10K combinations)
 ```bash
-python tptscrape.py extract
-python tptscrape.py stats
+# Download all free products
+python tpt_scraper_refactored.py download <config-name>
+
+# Download with filters
+python tpt_scraper_refactored.py download <config-name> --filter resource_type=teacher-tools
+python tpt_scraper_refactored.py download <config-name> --filter subject=classroom-management
 ```
 
-### Large Scale (10K-100K combinations)
+**What it does:**
+- Finds all free products in your search results
+- Downloads files using Playwright automation
+- Saves to `downloads_<config-name>/` directory
+- Tracks downloads to avoid duplicates
+
+**Output:** Downloaded files in `downloads_<config-name>/`
+
+## 📊 Example: Classroom Management Free Resources
+
 ```bash
-python optimize.py analyze
-python optimize.py sample
-python tptscrape.py extract
-python tptscrape.py stats
+# 1. Create a targeted configuration
+cat > classroom-mgmt-config.json << EOF
+{
+  "resource_type": ["teacher-tools"],
+  "grade_level": [
+    "elementary/kindergarten",
+    "elementary/1st-grade",
+    "elementary/2nd-grade",
+    "elementary/3rd-grade",
+    "elementary/4th-grade",
+    "elementary/5th-grade"
+  ],
+  "subject": ["social-emotional/classroom-management"],
+  "format": [""],
+  "price_options": ["free"],
+  "supports": [""],
+  "sorting_methods": ["Relevance", "Rating"],
+  "total_pages": 30,
+  "concurrent_requests": 25
+}
+EOF
+
+python tpt_scraper_refactored.py config create classroom-mgmt \
+  --template classroom-mgmt-config.json \
+  --description "Free classroom management resources for elementary"
+
+# 2. Run the workflows
+python tpt_scraper_refactored.py search classroom-mgmt
+python tpt_scraper_refactored.py scrape classroom-mgmt
+python tpt_scraper_refactored.py download classroom-mgmt
+
+# 3. Check results
+python tpt_scraper_refactored.py stats classroom-mgmt
 ```
 
-### Very Large Scale (100K+ combinations)
+## 🗂️ File Organization
+
+```
+tpt_scraper/
+├── config_manager.py              # Configuration management
+├── tpt_scraper_refactored.py      # Main refactored script
+├── configs/                        # Named configurations
+│   ├── registry.json              # Config registry
+│   ├── classroom-mgmt.json        # Example config
+│   └── my-search.json             # Another config
+├── scrape_cache_classroom-mgmt.db # Database for classroom-mgmt config
+├── scrape_cache_my-search.db      # Database for my-search config
+├── downloads_classroom-mgmt/      # Downloads for classroom-mgmt
+└── downloads_my-search/           # Downloads for my-search
+```
+
+## 🔧 Advanced Usage
+
+### Resume Interrupted Searches
+
+The search workflow automatically tracks what's been searched. If interrupted:
+
 ```bash
-python optimize.py analyze
-python optimize.py sample --samples 10000
-python optimize.py prefilter  # May take hours
-python tptscrape.py extract
-python tptscrape.py stats
+# Just run again - it will continue where it left off
+python tpt_scraper_refactored.py search my-search
 ```
 
-## 🛡️ Error Handling
+### Incremental Scraping
 
-- **Exponential Backoff**: Intelligent retry strategies
-- **Network Resilience**: Handles timeouts and connection errors
-- **Data Integrity**: Database transactions and conflict resolution
-- **Graceful Degradation**: Continues operation despite individual failures
+Only scrapes URLs that don't have metadata yet:
 
-## 📝 Output Data
+```bash
+# Add more search results, then scrape only new ones
+python tpt_scraper_refactored.py scrape my-search
+```
 
-Extracted data includes:
-- Product URLs and metadata
-- Titles and descriptions
-- Ratings and review counts
-- Pricing information
-- Category and filter classifications
-- Performance and efficiency metrics
+### Filtered Downloads
 
-## 🤝 Contributing
+Download only specific types of free products:
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+```bash
+# Only download teacher-tools
+python tpt_scraper_refactored.py download my-search --filter resource_type=teacher-tools
 
-## 📄 License
+# Only download kindergarten resources  
+python tpt_scraper_refactored.py download my-search --filter grade_level=elementary/kindergarten
+```
 
-[Add your license information here]
+### Custom Concurrent Requests
 
-## 🆘 Troubleshooting
+```bash
+# Download with more concurrent downloads
+python tpt_scraper_refactored.py download my-search --concurrent 10
+```
 
-### Common Issues
+## 🆚 Comparison with Original Script
 
-**High error rates**: Reduce `concurrent_requests` in config.json
-**Slow performance**: Increase batch size or check network connectivity
-**Memory issues**: Process in smaller batches or increase system memory
-**Empty results**: Verify filter combinations are valid for TPT
+### Original Script
+- Single monolithic workflow
+- One database for everything
+- Mix of search/scrape/download logic
+- Hard to manage different searches
 
-### Getting Help
+### Refactored Script
+- ✅ Three clear, independent workflows
+- ✅ Multiple named configurations
+- ✅ Isolated databases per config
+- ✅ Easy to run specific stages
+- ✅ Better for targeted searches
 
-- Check the performance monitor for optimization suggestions
-- Review logs for detailed error information
-- Use test modes to verify functionality
-- Monitor database growth and performance metrics
+## 🔄 Migration from Original Script
 
----
+If you have data in the original `scrape_cache.db`:
 
-Built with ❤️ for efficient web scraping and data collection.
+```bash
+# 1. Create a config representing your old search
+python tpt_scraper_refactored.py config create legacy --template config.json
+
+# 2. Copy your old database
+cp scrape_cache.db scrape_cache_legacy.db
+
+# 3. Use the new workflows going forward
+python tpt_scraper_refactored.py stats legacy
+```
+
+## 📝 Notes
+
+- **Authentication**: For downloads, you still need `tpt_storage.json` with your TPT login session
+- **Rate Limiting**: Adaptive rate limiting is built in to avoid overwhelming TPT
+- **Resumable**: All workflows can be stopped and resumed safely
+- **Concurrent**: Configurable concurrency for both searching and scraping
+
+## 🎓 Typical Workflow
+
+```bash
+# 1. Define what you want to search for
+python tpt_scraper_refactored.py config create science-5th \
+  --description "5th grade science resources"
+
+# 2. Edit the config to be specific
+notepad configs/science-5th.json
+
+# 3. Search for products
+python tpt_scraper_refactored.py search science-5th
+
+# 4. Get detailed metadata
+python tpt_scraper_refactored.py scrape science-5th
+
+# 5. Download free resources
+python tpt_scraper_refactored.py download science-5th
+
+# 6. Analyze your data
+python tpt_scraper_refactored.py stats science-5th
+# Or query the database directly:
+# sqlite3 scrape_cache_science-5th.db "SELECT * FROM product_metadata WHERE product_price = '0.00'"
+```

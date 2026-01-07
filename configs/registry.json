@@ -1,0 +1,16 @@
+{
+  "configs": {
+    "sel": {
+      "file": "configs\\sel.json",
+      "created": "2026-01-07T11:09:21.901316",
+      "description": "Social-Emotional Learning resources - full configuration",
+      "db_file": "scrape_cache_sel.db"
+    },
+    "coding": {
+      "file": "configs\\coding.json",
+      "created": "2026-01-07T11:10:51.502490",
+      "description": "Free classroom management materials for all grades",
+      "db_file": "scrape_cache_coding.db"
+    }
+  }
+}

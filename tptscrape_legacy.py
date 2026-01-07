@@ -776,7 +776,8 @@ async def scrape_product_data(session, url, rate_limiter: Optional[AdaptiveRateL
     title = soup.title.string if soup.title else None
     meta_desc = soup.find("meta", {"name": "description"})
     short_description = meta_desc["content"] if meta_desc and meta_desc.has_attr("content") else None
-    long_desc_elem = soup.find(class_="ProductDescriptionLayout__htmlDisplay")
+    # Updated selector - TPT changed class name from ProductDescriptionLayout to DescriptionLayout
+    long_desc_elem = soup.select_one('div[class*="htmlDisplay"]')
     long_description = extract_text_with_spacing(long_desc_elem) if long_desc_elem else None
     rating_value = None
     number_of_ratings = None
@@ -1268,6 +1269,83 @@ async def backfill_preview_keywords(batch_size=50, concurrency=20):
                 f"Total requests: {rate_limiter.total_count}, "
                 f"Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
 
+async def backfill_null_long_descriptions(batch_size=50, concurrency=20):
+    """
+    Find product_data records with NULL long_description, scrape, and update them.
+    """
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id, url FROM product_data WHERE long_description IS NULL OR long_description = ''"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        logging.info("No records missing long_description.")
+        return
+
+    logging.info(f"Backfilling long_description for {len(rows)} records.")
+
+    # Initialize rate limiter for backfill
+    rate_limiter = AdaptiveRateLimiter(
+        initial_delay=1.0,
+        max_delay=15.0,
+        error_threshold=0.1
+    )
+
+    total = len(rows)
+    sem = asyncio.Semaphore(concurrency)
+    
+    # Enhanced session configuration
+    connector = aiohttp.TCPConnector(
+        limit=concurrency + 5,
+        limit_per_host=concurrency,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp_client_cache.CachedSession(
+        cache_name="aiohttp_cache", 
+        expire_after=3600,
+        connector=connector,
+        timeout=timeout
+    ) as session:
+        async with aiosqlite.connect(DB_FILE) as db:  # Reuse connection
+            for i in range(0, total, batch_size):
+                batch = rows[i:i+batch_size]
+                async def scrape_with_sem(url):
+                    async with sem:
+                        return await scrape_product_data(session, url, rate_limiter)
+                tasks = [scrape_with_sem(url) for _, url in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                updates = []
+                failed_urls = []
+                for (row, result) in zip(batch, results):
+                    prod_id, url = row
+                    if result and not isinstance(result, Exception):
+                        long_description = result[2]  # 3rd item in tuple
+                        if long_description:
+                            updates.append((long_description, prod_id))
+                    else:
+                        failed_urls.append(url)
+                        if isinstance(result, Exception):
+                            logging.warning(f"Failed to scrape long_description for id={prod_id}, url={url}: {result}")
+                if updates:
+                    await db.executemany(
+                        "UPDATE product_data SET long_description = ? WHERE id = ?",
+                        updates
+                    )
+                    await db.commit()
+                completed = min(i + batch_size, total)
+                percent = (completed / total) * 100
+                logging.info(f"Updated {len(updates)} records in batch {i//batch_size+1}. {completed}/{total} ({percent:.2f}%%) complete.")
+
+    logging.info("Backfill of long_description complete.")
+    logging.info(f"Rate limiter stats - Final delay: {rate_limiter.current_delay:.2f}s, "
+                f"Total requests: {rate_limiter.total_count}, "
+                f"Error rate: {rate_limiter.error_count / max(rate_limiter.total_count, 1):.2%}")
+
 ###########################
 # Backfill Long Descriptions Stage
 ###########################
@@ -1663,7 +1741,7 @@ async def main():
     parser = argparse.ArgumentParser(
         description="TPT Scraper Tool: Extract, process, and download TPT product data with adaptive performance optimization."
     )
-    subparsers = parser.add_subparsers(dest="stage", required=True, help="Stage to run")
+    subparsers = parser.add_subparsers(dest="stage", required=False, help="Stage to run")
 
     # Test stage
     subparsers.add_parser("test", help="Test extraction on a single page.")
@@ -1707,13 +1785,50 @@ async def main():
         action="store_true",
         help="Backfill missing preview_keywords for product data (runs independently of stage)."
     )
+    
+    # Backfill long_description (as a separate flag, not a stage)
+    parser.add_argument(
+        "--backfill-long-desc",
+        action="store_true",
+        help="Backfill missing long_description for product data (runs independently of stage)."
+    )
+    
+    # Optional parameters for backfill operations
+    parser.add_argument(
+        "--backfill-batch-size",
+        type=int,
+        default=100,
+        help="Batch size for backfill operations (default: 100)"
+    )
+    parser.add_argument(
+        "--backfill-concurrency",
+        type=int,
+        default=30,
+        help="Concurrency level for backfill operations (default: 30)"
+    )
 
     args = parser.parse_args()
     await setup_db()
 
     # Run backfill_preview_keywords exclusively if requested
     if args.backfill_preview:
-        await backfill_preview_keywords()
+        await backfill_preview_keywords(
+            batch_size=args.backfill_batch_size,
+            concurrency=args.backfill_concurrency
+        )
+        return
+    
+    # Run backfill_null_long_descriptions exclusively if requested
+    if args.backfill_long_desc:
+        await backfill_null_long_descriptions(
+            batch_size=args.backfill_batch_size,
+            concurrency=args.backfill_concurrency
+        )
+        return
+
+    # If no stage is specified and no backfill flags, show error
+    if not args.stage:
+        parser.error("Please specify a stage or use a backfill flag (--backfill-preview or --backfill-long-desc)")
         return
 
     if args.stage == "test":
