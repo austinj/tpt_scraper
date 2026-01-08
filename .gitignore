@@ -4,6 +4,9 @@ scrape_cache*
 sqlite3.exe
 free_product_export/
 tpt_storage.json
+downloads_*/
+sample_page.html
+*.db-journal
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

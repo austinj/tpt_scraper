@@ -395,15 +395,17 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     long_desc_elem = soup.select_one('div[class*="htmlDisplay"]')
     long_description = extract_text_with_spacing(long_desc_elem) if long_desc_elem else None
     
+    # Extract rating from meta tags (more reliable than parsing text)
     rating_value = None
     number_of_ratings = None
-    rating_elem = soup.select_one("span.StarRating-module__srOnly--FAzEA")
-    if rating_elem:
-        rating_text = rating_elem.get_text(separator=" ", strip=True)
-        parts = rating_text.split()
-        if len(parts) >= 3:
-            rating_value = parts[1]
-            number_of_ratings = parts[-2]
+    
+    meta_rating = soup.find("meta", {"property": "og:rating"})
+    if meta_rating and meta_rating.has_attr("content"):
+        rating_value = meta_rating["content"]
+    
+    meta_rating_count = soup.find("meta", {"property": "og:rating_count"})
+    if meta_rating_count and meta_rating_count.has_attr("content"):
+        number_of_ratings = meta_rating_count["content"]
     
     # Extract price
     product_price = None
@@ -426,8 +428,10 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     if grade_level or categories:
         preview_keywords = (grade_level or "") + (" " if grade_level and categories else "") + ", ".join(categories)
     
-    return (title, short_description, long_description, rating_value, number_of_ratings, 
-            product_price, preview_keywords, url)
+    # Return tuple in order matching INSERT: url, title, short_description, long_description, 
+    # rating_value, number_of_ratings, product_price, preview_keywords
+    return (url, title, short_description, long_description, rating_value, number_of_ratings, 
+            product_price, preview_keywords)
 
 async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 25):
     """
@@ -514,11 +518,25 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
 # 3. DOWNLOAD FREE FILES  #
 ###########################
 
+def extract_product_id(url: str) -> str:
+    """Extract product ID from TPT URL. e.g., 'Product-Name-1234567' -> '1234567'"""
+    import re
+    # URL format: .../Product/Product-Name-1234567
+    match = re.search(r'/Product/[^/]+-(\d+)(?:\?|$)', url)
+    if match:
+        return match.group(1)
+    # Fallback to URL hash
+    return str(abs(hash(url)) % (10 ** 8))
+
 async def download_free_file(product_url: str, session_file: str = "tpt_storage.json", 
                             downloads_dir: Path = Path("downloads"), max_retries: int = 3):
-    """Download a free file from TPT."""
+    """Download a free file from TPT into a product-specific folder."""
     free_url = product_url.replace("/Product/", "/FreeDownload/")
-    downloads_dir.mkdir(exist_ok=True)
+    
+    # Create product-specific folder using product ID
+    product_id = extract_product_id(product_url)
+    product_dir = downloads_dir / product_id
+    product_dir.mkdir(parents=True, exist_ok=True)
     
     for attempt in range(1, max_retries + 1):
         try:
@@ -530,16 +548,15 @@ async def download_free_file(product_url: str, session_file: str = "tpt_storage.
                 )
                 page = await context.new_page()
                 
-                logging.info(f"Attempt {attempt}: Downloading {free_url}")
+                logging.info(f"[{product_id}] Attempt {attempt}: Downloading {free_url}")
                 async with page.expect_download() as download_info:
                     await page.goto(free_url)
                 
                 download = await download_info.value
                 suggested_name = download.suggested_filename
                 
-                # Use URL hash for unique filename
-                url_hash = abs(hash(product_url)) % (10 ** 8)
-                save_path = downloads_dir / f"{url_hash}_{suggested_name}"
+                # Save to product folder with original filename
+                save_path = product_dir / suggested_name
                 await download.save_as(save_path)
                 
                 # Verify file
@@ -547,24 +564,37 @@ async def download_free_file(product_url: str, session_file: str = "tpt_storage.
                     raise Exception("Downloaded file is empty or missing")
                 
                 file_size = save_path.stat().st_size
-                logging.info(f"✅ Downloaded: {save_path.name} ({file_size:,} bytes)")
+                logging.info(f"[{product_id}] ✅ Downloaded: {save_path.name} ({file_size:,} bytes)")
                 
                 await browser.close()
-                return str(save_path), file_size
+                return str(save_path), file_size, product_dir
                 
         except Exception as e:
-            logging.warning(f"Attempt {attempt} failed: {e}")
+            logging.warning(f"[{product_id}] Attempt {attempt} failed: {e}")
             if attempt == max_retries:
-                logging.error(f"Failed after {max_retries} attempts")
+                logging.error(f"[{product_id}] Failed after {max_retries} attempts")
             await asyncio.sleep(2)
     
-    return None, None
+    return None, None, None
+
+def extract_zip_in_place(zip_path: Path) -> bool:
+    """Extract a zip file in its containing folder and optionally remove the zip."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(zip_path.parent)
+        logging.info(f"📦 Extracted: {zip_path.name}")
+        return True
+    except Exception as e:
+        logging.warning(f"Failed to extract {zip_path.name}: {e}")
+        return False
 
 async def download_free_products(config_name: str, db_file: str, 
                                 filters: Optional[Dict[str, Any]] = None,
                                 session_file: str = "tpt_storage.json",
                                 concurrent_downloads: int = 5,
-                                use_queue: bool = False):
+                                use_queue: bool = False,
+                                auto_extract: bool = False):
     """
     Download all free products found in search that match filters.
     
@@ -582,6 +612,8 @@ async def download_free_products(config_name: str, db_file: str,
         logging.info(f"MODE: Using download_queue table")
     logging.info(f"=" * 60)
     
+    downloads_dir = Path(f"downloads_{config_name}")
+    
     # Build query based on mode
     if use_queue:
         # Download from manually populated queue
@@ -589,8 +621,6 @@ async def download_free_products(config_name: str, db_file: str,
             SELECT DISTINCT q.product_url, m.product_price
             FROM download_queue q
             JOIN product_metadata m ON q.product_url = m.url
-            LEFT JOIN downloads d ON q.product_url = d.product_url
-            WHERE d.product_url IS NULL
             ORDER BY q.priority DESC, q.added_at ASC
         """
         params = []
@@ -600,9 +630,7 @@ async def download_free_products(config_name: str, db_file: str,
             SELECT DISTINCT s.url, m.product_price
             FROM search_results s
             JOIN product_metadata m ON s.url = m.url
-            LEFT JOIN downloads d ON s.url = d.product_url
             WHERE s.price_option = 'free'
-            AND d.product_url IS NULL
         """
         
         params = []
@@ -623,7 +651,21 @@ async def download_free_products(config_name: str, db_file: str,
     # Get URLs to download
     async with aiosqlite.connect(db_file) as db:
         async with db.execute(query, params) as cursor:
-            urls_to_download = [(row[0], row[1]) for row in await cursor.fetchall()]
+            all_urls = [(row[0], row[1]) for row in await cursor.fetchall()]
+    
+    # Filter out already downloaded (check if folder exists)
+    urls_to_download = []
+    already_downloaded = 0
+    for url, price in all_urls:
+        product_id = extract_product_id(url)
+        product_folder = downloads_dir / product_id
+        if product_folder.exists() and any(product_folder.iterdir()):
+            already_downloaded += 1
+        else:
+            urls_to_download.append((url, price))
+    
+    if already_downloaded > 0:
+        logging.info(f"Skipping {already_downloaded:,} already downloaded (folder exists)")
     
     if not urls_to_download:
         logging.info("No free products to download!")
@@ -635,7 +677,6 @@ async def download_free_products(config_name: str, db_file: str,
     
     # Download
     semaphore = asyncio.Semaphore(concurrent_downloads)
-    downloads_dir = Path(f"downloads_{config_name}")
     
     async def download_with_sem(url):
         async with semaphore:
@@ -643,11 +684,12 @@ async def download_free_products(config_name: str, db_file: str,
     
     success_count = 0
     fail_count = 0
+    extracted_count = 0
     
     for i, (url, price) in enumerate(urls_to_download, 1):
         logging.info(f"Processing {i}/{len(urls_to_download)}: {url}")
         
-        file_path, file_size = await download_with_sem(url)
+        file_path, file_size, product_dir = await download_with_sem(url)
         
         if file_path:
             # Store in database
@@ -658,6 +700,11 @@ async def download_free_products(config_name: str, db_file: str,
                 """, (url, file_path, file_size))
                 await db.commit()
             success_count += 1
+            
+            # Auto-extract zips if requested
+            if auto_extract and file_path.endswith('.zip'):
+                if extract_zip_in_place(Path(file_path)):
+                    extracted_count += 1
         else:
             fail_count += 1
         
@@ -668,6 +715,8 @@ async def download_free_products(config_name: str, db_file: str,
     logging.info(f"=" * 60)
     logging.info(f"DOWNLOAD COMPLETE")
     logging.info(f"Successful: {success_count:,}")
+    if auto_extract:
+        logging.info(f"Extracted: {extracted_count:,}")
     logging.info(f"Failed: {fail_count:,}")
     logging.info(f"Files saved to: {downloads_dir}")
     logging.info(f"=" * 60)
@@ -770,7 +819,7 @@ async def cmd_download(args):
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
     await download_free_products(args.config, db_file, filters, args.session_file, 
-                                args.concurrent, args.use_queue)
+                                args.concurrent, args.use_queue, args.extract)
 
 async def cmd_stats(args):
     """Show statistics for a configuration."""
@@ -869,6 +918,7 @@ Examples:
     download_parser.add_argument("--session-file", default="tpt_storage.json", help="Playwright session file")
     download_parser.add_argument("--concurrent", type=int, default=5, help="Concurrent downloads")
     download_parser.add_argument("--use-queue", action="store_true", help="Download only products in download_queue table")
+    download_parser.add_argument("--extract", action="store_true", help="Auto-extract zip files after download")
     
     # Stats
     stats_parser = subparsers.add_parser("stats", help="Show statistics")
