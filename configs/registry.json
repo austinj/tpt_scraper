@@ -11,6 +11,12 @@
       "created": "2026-01-07T11:10:51.502490",
       "description": "Free classroom management materials for all grades",
       "db_file": "scrape_cache_coding.db"
+    },
+    "sel_simple": {
+      "file": "configs\\sel_simple.json",
+      "created": "2026-02-04T15:42:00.000000",
+      "description": "SEL resources - simplified config (all grades x SEL subjects x all prices)",
+      "db_file": "scrape_cache_sel_simple.db"
     }
   }
 }

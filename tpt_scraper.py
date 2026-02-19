@@ -59,6 +59,7 @@ async def setup_db(db_file: str):
             CREATE TABLE IF NOT EXISTS product_metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT UNIQUE,
+                product_id TEXT,
                 title TEXT,
                 short_description TEXT,
                 long_description TEXT,
@@ -66,9 +67,33 @@ async def setup_db(db_file: str):
                 number_of_ratings TEXT,
                 product_price TEXT,
                 preview_keywords TEXT,
+                author_name TEXT,
+                author_store_url TEXT,
+                author_follower_count INTEGER,
+                oldest_review_date TEXT,
                 scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Migration: Add new columns if they don't exist (for existing databases)
+        async with db.execute("PRAGMA table_info(product_metadata)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        
+        migrations = [
+            ("author_name", "TEXT"),
+            ("author_store_url", "TEXT"),
+            ("author_follower_count", "INTEGER"),
+            ("product_id", "TEXT"),
+            ("oldest_review_date", "TEXT"),
+        ]
+        
+        for col_name, col_type in migrations:
+            if col_name not in existing_columns:
+                await db.execute(f"ALTER TABLE product_metadata ADD COLUMN {col_name} {col_type}")
+                logging.info(f"Migration: Added column '{col_name}' to product_metadata")
+        
+        # Create index on product_id for faster lookups
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_metadata_product_id ON product_metadata(product_id);")
         
         # Downloaded files
         await db.execute("""
@@ -428,29 +453,90 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     if grade_level or categories:
         preview_keywords = (grade_level or "") + (" " if grade_level and categories else "") + ", ".join(categories)
     
-    # Return tuple in order matching INSERT: url, title, short_description, long_description, 
-    # rating_value, number_of_ratings, product_price, preview_keywords
-    return (url, title, short_description, long_description, rating_value, number_of_ratings, 
-            product_price, preview_keywords)
+    # Extract author/seller info
+    author_name = None
+    author_store_url = None
+    author_follower_count = None
+    
+    # Find author store link (usually in the "Meet the Teacher-Author" section or sidebar)
+    author_link = soup.select_one('a[href*="/store/"]')
+    if author_link:
+        author_store_url = author_link.get('href', '')
+        if not author_store_url.startswith('http'):
+            author_store_url = 'https://www.teacherspayteachers.com' + author_store_url
+        author_name = author_link.get_text(strip=True)
+    
+    # Extract follower count from the AboutAuthorRow follow container
+    # The container combines "Follow", count, and "Followers" across child elements,
+    # so we get the combined text and parse the number from it.
+    # When a seller has 0 followers, the container only shows "Follow" with no count.
+    follow_container = soup.find('div', class_=re.compile(r'AboutAuthorRow-module__followContainer'))
+    if follow_container:
+        container_text = follow_container.get_text(strip=True)
+        match = re.search(r'([\d,\.]+)\s*([kKmM])?\s*Followers?', container_text, re.IGNORECASE)
+        if match:
+            num_str = match.group(1).replace(',', '')
+            suffix = match.group(2)
+            try:
+                num = float(num_str)
+                if suffix:
+                    suffix = suffix.lower()
+                    if suffix == 'k':
+                        num *= 1000
+                    elif suffix == 'm':
+                        num *= 1000000
+                author_follower_count = int(num)
+            except ValueError:
+                author_follower_count = 0
+        else:
+            # Container exists but no count found — seller has 0 followers
+            author_follower_count = 0
+    
+    # Extract product ID from URL
+    product_id = None
+    id_match = re.search(r'/Product/[^/]+-?(\d+)(?:\?|$)', url)
+    if id_match:
+        product_id = id_match.group(1)
+    
+    # Return tuple in order matching INSERT: url, product_id, title, short_description, long_description, 
+    # rating_value, number_of_ratings, product_price, preview_keywords, author_name, author_store_url, author_follower_count
+    return (url, product_id, title, short_description, long_description, rating_value, number_of_ratings, 
+            product_price, preview_keywords, author_name, author_store_url, author_follower_count)
 
-async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 25):
+async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 25, rescrape: bool = False, no_cache: bool = False):
     """
     Scrape metadata for all URLs found in search.
-    Only scrapes URLs that haven't been scraped yet.
+    
+    Args:
+        config_name: Configuration name
+        db_file: Database file path
+        concurrent_requests: Number of concurrent requests
+        rescrape: If True, re-scrape ALL products (not just new ones)
+        no_cache: If True, bypass HTTP cache for fresh fetches
     """
     logging.info(f"=" * 60)
     logging.info(f"SCRAPE METADATA WORKFLOW - Configuration: {config_name}")
+    if rescrape:
+        logging.info(f"MODE: Rescraping ALL products")
+    if no_cache:
+        logging.info(f"MODE: Cache disabled (fresh fetches)")
     logging.info(f"=" * 60)
     
-    # Get URLs that need metadata
+    # Get URLs to scrape
     async with aiosqlite.connect(db_file) as db:
-        async with db.execute("""
-            SELECT DISTINCT s.url
-            FROM search_results s
-            LEFT JOIN product_metadata m ON s.url = m.url
-            WHERE m.url IS NULL
-        """) as cursor:
-            urls_to_scrape = [row[0] for row in await cursor.fetchall()]
+        if rescrape:
+            # Rescrape all URLs from search results
+            async with db.execute("SELECT DISTINCT url FROM search_results") as cursor:
+                urls_to_scrape = [row[0] for row in await cursor.fetchall()]
+        else:
+            # Only scrape URLs that don't have metadata yet
+            async with db.execute("""
+                SELECT DISTINCT s.url
+                FROM search_results s
+                LEFT JOIN product_metadata m ON s.url = m.url
+                WHERE m.url IS NULL
+            """) as cursor:
+                urls_to_scrape = [row[0] for row in await cursor.fetchall()]
     
     if not urls_to_scrape:
         logging.info("All URLs already have metadata!")
@@ -473,15 +559,24 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
         async with semaphore:
             return await scrape_product_metadata(session, url, rate_limiter)
     
-    async with aiohttp_client_cache.CachedSession(
-        cache_name="aiohttp_cache",
-        expire_after=3600,
-        connector=connector,
-        timeout=timeout
-    ) as session:
+    # Use cached session or regular session based on no_cache flag
+    if no_cache:
+        session_context = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    else:
+        session_context = aiohttp_client_cache.CachedSession(
+            cache_name="aiohttp_cache",
+            expire_after=3600,
+            connector=connector,
+            timeout=timeout
+        )
+    
+    async with session_context as session:
         
         batch_size = 100
         scraped_count = 0
+        failed_count = 0
+        start_time = time.time()
+        total_items = len(urls_to_scrape)
         
         for i in range(0, len(urls_to_scrape), batch_size):
             batch = urls_to_scrape[i:i+batch_size]
@@ -494,24 +589,287 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
             async with aiosqlite.connect(db_file) as db:
                 for result in results:
                     if result and not isinstance(result, Exception):
-                        await db.execute("""
-                            INSERT OR IGNORE INTO product_metadata
-                            (url, title, short_description, long_description, rating_value, 
-                             number_of_ratings, product_price, preview_keywords)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, result)
+                        if rescrape:
+                            # Upsert: update if exists, insert if not
+                            await db.execute("""
+                                INSERT INTO product_metadata
+                                (url, product_id, title, short_description, long_description, rating_value, 
+                                 number_of_ratings, product_price, preview_keywords, author_name,
+                                 author_store_url, author_follower_count, scraped_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(url) DO UPDATE SET
+                                    product_id = excluded.product_id,
+                                    title = excluded.title,
+                                    short_description = excluded.short_description,
+                                    long_description = excluded.long_description,
+                                    rating_value = excluded.rating_value,
+                                    number_of_ratings = excluded.number_of_ratings,
+                                    product_price = excluded.product_price,
+                                    preview_keywords = excluded.preview_keywords,
+                                    author_name = excluded.author_name,
+                                    author_store_url = excluded.author_store_url,
+                                    author_follower_count = excluded.author_follower_count,
+                                    scraped_at = CURRENT_TIMESTAMP
+                            """, result)
+                        else:
+                            await db.execute("""
+                                INSERT OR IGNORE INTO product_metadata
+                                (url, product_id, title, short_description, long_description, rating_value, 
+                                 number_of_ratings, product_price, preview_keywords, author_name,
+                                 author_store_url, author_follower_count)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, result)
                         scraped_count += 1
+                    else:
+                        failed_count += 1
                 await db.commit()
             
-            logging.info(f"Progress: {min(i + batch_size, len(urls_to_scrape))}/{len(urls_to_scrape)}")
+            # Progress with time tracking
+            processed = min(i + batch_size, total_items)
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = total_items - processed
+            eta_seconds = remaining / rate if rate > 0 else 0
+            
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+            eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+            
+            logging.info(f"Progress: {processed:,}/{total_items:,} ({processed*100//total_items}%) | OK: {scraped_count:,} | Fail: {failed_count:,} | Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.1f}/s")
             
             # Sleep between batches
             if i + batch_size < len(urls_to_scrape):
                 await asyncio.sleep(random.uniform(1, 3))
     
+    total_elapsed = time.time() - start_time
     logging.info(f"=" * 60)
     logging.info(f"SCRAPING COMPLETE")
     logging.info(f"Metadata scraped for {scraped_count:,} products")
+    logging.info(f"Total time: {int(total_elapsed // 60)}m {int(total_elapsed % 60)}s")
+    logging.info(f"=" * 60)
+
+###########################
+# 2b. DEEP SCRAPE (Playwright)
+###########################
+
+async def deep_scrape_oldest_review(url: str, browser, session_file: str = "tpt_storage.json") -> Optional[str]:
+    """
+    Use Playwright to load a product page, click through all reviews,
+    and extract the oldest review date.
+    
+    Args:
+        url: Product URL to scrape
+        browser: Playwright browser instance (reused across calls)
+        session_file: Path to Playwright storage state
+    
+    Returns the oldest review date as a string (e.g., "October 28, 2008") or None.
+    """
+    from datetime import datetime
+    
+    product_id = extract_product_id(url)
+    oldest_date = None
+    oldest_datetime = None
+    
+    try:
+        context = await browser.new_context(storage_state=session_file)
+        page = await context.new_page()
+        
+        logging.info(f"[{product_id}] Deep scraping: {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # Give JS a moment to render review content
+        await page.wait_for_timeout(2000)
+        
+        # Click "Show more reviews" until it's gone or we hit a limit
+        max_clicks = 50  # Safety limit
+        clicks = 0
+        
+        while clicks < max_clicks:
+            try:
+                # Look for the "Show more reviews" button
+                show_more = page.locator("text=Show more reviews").first
+                if await show_more.is_visible(timeout=2000):
+                    await show_more.click()
+                    await page.wait_for_timeout(500)  # Wait for content to load
+                    clicks += 1
+                else:
+                    break
+            except:
+                break
+        
+        if clicks > 0:
+            logging.info(f"[{product_id}] Clicked 'Show more reviews' {clicks} times")
+        
+        # Now extract all review dates from the page
+        # Review dates appear as text like "February 3, 2026", "October 28, 2008", etc.
+        content = await page.content()
+        
+        # Close context to free resources
+        await context.close()
+        
+        # Check if the product actually has reviews via JSON-LD reviewCount/ratingCount
+        review_count_match = re.search(r'"reviewCount"\s*:\s*(\d+)', content)
+        rating_count_match = re.search(r'"ratingCount"\s*:\s*(\d+)', content)
+        review_count = int(review_count_match.group(1)) if review_count_match else 0
+        rating_count = int(rating_count_match.group(1)) if rating_count_match else 0
+        has_reviews = review_count > 0 or rating_count > 0
+        
+        if not has_reviews:
+            logging.info(f"[{product_id}] No reviews (count=0), skipping date extraction")
+            return None, False
+        
+        # 1. Parse ISO dates from JSON-LD "datePublished" fields (most reliable)
+        iso_matches = re.findall(r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})', content)
+        for date_str in iso_matches:
+            try:
+                parsed = datetime.strptime(date_str, "%Y-%m-%d")
+                if oldest_datetime is None or parsed < oldest_datetime:
+                    oldest_datetime = parsed
+                    oldest_date = date_str
+            except ValueError:
+                continue
+        
+        # No text-based fallback — regex on full page HTML matches dates from
+        # product descriptions (movie release dates, historical events), Q&A,
+        # teacher bios, etc. JSON-LD datePublished is scoped to reviews and
+        # is the only reliable source.
+        
+        if oldest_date:
+            logging.info(f"[{product_id}] Oldest review date: {oldest_date} (reviews: {review_count})")
+        else:
+            logging.warning(f"[{product_id}] Has {review_count} reviews but no dates extracted")
+        
+        return oldest_date, has_reviews
+            
+    except Exception as e:
+        logging.error(f"[{product_id}] Deep scrape failed: {e}")
+        return None, False
+
+
+async def deep_scrape_products(config_name: str, db_file: str, session_file: str = "tpt_storage.json",
+                               limit: Optional[int] = None, concurrent: int = 3):
+    """
+    Deep scrape products to find oldest review dates using Playwright.
+    Only processes products that don't already have an oldest_review_date.
+    Uses a single browser instance for efficiency.
+    """
+    logging.info(f"=" * 60)
+    logging.info(f"DEEP SCRAPE WORKFLOW - Configuration: {config_name}")
+    logging.info(f"=" * 60)
+    
+    # Bulk-mark products with 0 ratings as 'no_reviews' so we never visit them
+    async with aiosqlite.connect(db_file) as db:
+        cursor = await db.execute("""
+            UPDATE product_metadata
+            SET oldest_review_date = 'no_reviews'
+            WHERE oldest_review_date IS NULL
+              AND (number_of_ratings IS NULL OR CAST(number_of_ratings AS INTEGER) = 0)
+        """)
+        bulk_skipped = cursor.rowcount
+        await db.commit()
+    if bulk_skipped:
+        logging.info(f"Bulk-marked {bulk_skipped:,} products with 0 ratings as 'no_reviews'")
+
+    # Get URLs that need deep scraping (have ratings but no oldest_review_date yet)
+    async with aiosqlite.connect(db_file) as db:
+        query = """
+            SELECT url FROM product_metadata 
+            WHERE oldest_review_date IS NULL
+              AND CAST(number_of_ratings AS INTEGER) > 0
+            ORDER BY CAST(product_id AS INTEGER) ASC
+        """
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        async with db.execute(query) as cursor:
+            urls_to_scrape = [row[0] for row in await cursor.fetchall()]
+    
+    if not urls_to_scrape:
+        logging.info("All products already have oldest_review_date!")
+        return
+    
+    logging.info(f"Products to deep scrape: {len(urls_to_scrape):,} (only those with ratings)")
+    
+    # Launch browser once and reuse for all URLs
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        logging.info("Browser launched (will be reused for all URLs)")
+        
+        # Process with limited concurrency
+        semaphore = asyncio.Semaphore(concurrent)
+        scraped_count = 0
+        no_reviews_count = 0
+        missing_dates_count = 0
+        error_count = 0
+        start_time = time.time()
+        total_items = len(urls_to_scrape)
+        
+        async def scrape_with_sem(url):
+            async with semaphore:
+                oldest_date, has_reviews = await deep_scrape_oldest_review(url, browser, session_file)
+                return url, oldest_date, has_reviews
+        
+        # Process in batches to update DB periodically
+        batch_size = 10
+        
+        for i in range(0, len(urls_to_scrape), batch_size):
+            batch = urls_to_scrape[i:i+batch_size]
+            tasks = [scrape_with_sem(url) for url in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Store results
+            async with aiosqlite.connect(db_file) as db:
+                for result in results:
+                    if isinstance(result, Exception):
+                        logging.error(f"Batch error: {result}")
+                        error_count += 1
+                        continue
+                    url, oldest_date, has_reviews = result
+                    if oldest_date:
+                        await db.execute("""
+                            UPDATE product_metadata 
+                            SET oldest_review_date = ?
+                            WHERE url = ?
+                        """, (oldest_date, url))
+                        scraped_count += 1
+                    elif has_reviews:
+                        await db.execute("""
+                            UPDATE product_metadata 
+                            SET oldest_review_date = 'parse_failed'
+                            WHERE url = ?
+                        """, (url,))
+                        missing_dates_count += 1
+                    else:
+                        await db.execute("""
+                            UPDATE product_metadata 
+                            SET oldest_review_date = 'no_reviews'
+                            WHERE url = ?
+                        """, (url,))
+                        no_reviews_count += 1
+                await db.commit()
+            
+            # Progress with time tracking
+            processed = min(i + batch_size, total_items)
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = total_items - processed
+            eta_seconds = remaining / rate if rate > 0 else 0
+            
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+            eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+            
+            logging.info(f"Progress: {processed:,}/{total_items:,} ({processed*100//total_items}%) | Found: {scraped_count:,} | No reviews: {no_reviews_count:,} | Missing dates: {missing_dates_count:,} | Errors: {error_count:,} | Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.1f}/s")
+            
+            # Small delay between batches
+            if i + batch_size < len(urls_to_scrape):
+                await asyncio.sleep(1)
+        
+        await browser.close()
+        logging.info("Browser closed")
+    
+    total_elapsed = time.time() - start_time
+    logging.info(f"=" * 60)
+    logging.info(f"DEEP SCRAPE COMPLETE")
+    logging.info(f"Found oldest review dates for {scraped_count:,} products")
+    logging.info(f"Total time: {int(total_elapsed // 60)}m {int(total_elapsed % 60)}s")
     logging.info(f"=" * 60)
 
 ###########################
@@ -787,6 +1145,13 @@ async def cmd_search(args):
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
     await search_urls(args.config, config, db_file)
+    
+    # Auto-start scrape if --auto-scrape flag is set
+    if getattr(args, 'auto_scrape', False):
+        logging.info("=" * 60)
+        logging.info("AUTO-SCRAPE: Starting metadata scrape...")
+        logging.info("=" * 60)
+        await scrape_metadata(args.config, db_file, config.get("concurrent_requests", 25), False, False)
 
 async def cmd_scrape(args):
     """Run scrape metadata workflow."""
@@ -798,7 +1163,19 @@ async def cmd_scrape(args):
     
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
-    await scrape_metadata(args.config, db_file, config.get("concurrent_requests", 25))
+    await scrape_metadata(args.config, db_file, config.get("concurrent_requests", 25), args.rescrape, args.no_cache)
+
+async def cmd_deepscrape(args):
+    """Run deep scrape workflow to find oldest review dates."""
+    manager = ConfigManager()
+    config = manager.get_config(args.config)
+    if not config:
+        logging.error(f"Configuration '{args.config}' not found")
+        return
+    
+    db_file = manager.get_db_file(args.config)
+    await setup_db(db_file)
+    await deep_scrape_products(args.config, db_file, args.session_file, args.limit, args.concurrent)
 
 async def cmd_download(args):
     """Run download free files workflow."""
@@ -879,6 +1256,9 @@ Examples:
   # Scrape metadata
   python tpt_scraper_refactored.py scrape classroom-mgmt
   
+  # Deep scrape to find oldest review dates (uses Playwright)
+  python tpt_scraper_refactored.py deepscrape classroom-mgmt --limit 100
+  
   # Download free products
   python tpt_scraper_refactored.py download classroom-mgmt
   
@@ -906,10 +1286,20 @@ Examples:
     # Search
     search_parser = subparsers.add_parser("search", help="Search for product URLs")
     search_parser.add_argument("config", help="Configuration name")
+    search_parser.add_argument("--auto-scrape", action="store_true", dest="auto_scrape", help="Automatically start scraping metadata after search completes")
     
     # Scrape metadata
     scrape_parser = subparsers.add_parser("scrape", help="Scrape product metadata")
     scrape_parser.add_argument("config", help="Configuration name")
+    scrape_parser.add_argument("--rescrape", action="store_true", help="Re-scrape ALL products, updating existing records")
+    scrape_parser.add_argument("--no-cache", action="store_true", dest="no_cache", help="Bypass HTTP cache for fresh fetches")
+    
+    # Deep scrape (Playwright-based)
+    deepscrape_parser = subparsers.add_parser("deepscrape", help="Deep scrape to find oldest review dates (uses Playwright)")
+    deepscrape_parser.add_argument("config", help="Configuration name")
+    deepscrape_parser.add_argument("--session-file", default="tpt_storage.json", help="Playwright session file")
+    deepscrape_parser.add_argument("--limit", type=int, help="Limit number of products to deep scrape")
+    deepscrape_parser.add_argument("--concurrent", type=int, default=3, help="Concurrent browser instances (default: 3)")
     
     # Download
     download_parser = subparsers.add_parser("download", help="Download free products")
@@ -936,6 +1326,8 @@ Examples:
         await cmd_search(args)
     elif args.command == "scrape":
         await cmd_scrape(args)
+    elif args.command == "deepscrape":
+        await cmd_deepscrape(args)
     elif args.command == "download":
         await cmd_download(args)
     elif args.command == "stats":
