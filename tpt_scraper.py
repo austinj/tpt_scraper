@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
 from collections import deque
 from typing import Optional, Dict, Any, List, Tuple
 from config_manager import ConfigManager
@@ -193,6 +193,17 @@ def build_page_url(resource_type, grade_level, subject, format_type, price_optio
     
     return f"{base_url}?{'&'.join(query_params)}" if query_params else base_url
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
 async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None, max_retries=3):
     """Fetch a URL with retry logic."""
     retries = 0
@@ -205,7 +216,7 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
                 await rate_limiter.wait()
                 
             async with async_timeout.timeout(30):
-                async with session.get(url) as response:
+                async with session.get(url, headers=BROWSER_HEADERS) as response:
                     response_time = time.time() - start_time
                     
                     if response.status == 200:
@@ -215,7 +226,9 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
                     elif response.status == 429:
                         if rate_limiter:
                             rate_limiter.record_response(False, response_time)
-                        await asyncio.sleep(backoff)
+                        wait = int(response.headers.get("Retry-After", backoff * 4))
+                        logging.warning(f"Rate limited (429) — waiting {wait}s")
+                        await asyncio.sleep(wait)
                         raise Exception(f"Rate limited (429)")
                     elif response.status >= 500:
                         if rate_limiter:
@@ -257,7 +270,10 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
     supports = config.get("supports", [""])
     sorting_methods = config.get("sorting_methods", ["Relevance"])
     total_pages = config.get("total_pages", 42)
-    concurrent_requests = config.get("concurrent_requests", 25)
+    concurrent_requests = config.get("concurrent_requests", 8)
+    batch_size = config.get("batch_size", 100)
+    sleep_min, sleep_max = config.get("sleep_between_batches", [1.0, 3.0])
+    max_rate_limit_delay = config.get("max_rate_limit_delay", 30.0)
     
     # Generate all combinations
     combinations = [
@@ -303,16 +319,16 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
         return
     
     # Initialize components
-    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=30.0)
+    rate_limiter = AdaptiveRateLimiter(initial_delay=1.0, max_delay=max_rate_limit_delay)
     semaphore = asyncio.Semaphore(concurrent_requests)
-    
+
     connector = aiohttp.TCPConnector(
         limit=concurrent_requests + 10,
         limit_per_host=concurrent_requests,
         keepalive_timeout=30
     )
     timeout = aiohttp.ClientTimeout(total=60, connect=10)
-    
+
     async def search_page(combo):
         """Search a single page and store results."""
         resource_type, grade_level, subject, format_type, price_option, supports_val, sort_order, page = combo
@@ -366,7 +382,7 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
     ) as session:
         
         # Process in batches
-        batch_size = 100
+        batch_size = config.get("batch_size", 100)  # use config value
         for i in range(0, len(remaining), batch_size):
             batch = remaining[i:i+batch_size]
             logging.info(f"Processing batch {i//batch_size + 1}/{(len(remaining) + batch_size - 1)//batch_size}")
@@ -379,7 +395,7 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
             
             # Sleep between batches
             if i + batch_size < len(remaining):
-                await asyncio.sleep(random.uniform(1, 3))
+                await asyncio.sleep(random.uniform(sleep_min, sleep_max))
     
     # Final stats
     async with aiosqlite.connect(db_file) as db:
@@ -440,12 +456,13 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     
     # Extract categories/keywords
     grade_level = None
-    grade_elem = soup.select_one('[data-testid="RebrandedContentText"] .NotLinkedSection span')
+    grade_elem = soup.find(attrs={"data-testid": "GradesLabel"})
     if grade_elem:
-        grade_level = grade_elem.get_text(strip=True)
+        grade_text = grade_elem.get_text(strip=True)
+        grade_level = re.sub(r'^Mostly used with\s*', '', grade_text).strip() or None
     
     categories = []
-    category_elems = soup.select('div[data-testid="LabeledSectionContent"] a.Link-module__link--GFbUH')
+    category_elems = soup.select('[data-testid^="Link_"]')
     if category_elems:
         categories = [cat.get_text(strip=True) for cat in category_elems]
     
@@ -458,13 +475,15 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     author_store_url = None
     author_follower_count = None
     
-    # Find author store link (usually in the "Meet the Teacher-Author" section or sidebar)
-    author_link = soup.select_one('a[href*="/store/"]')
+    # Find author store link and name via the avatar aria-label
+    author_link = soup.find(attrs={"data-testid": "authorAvatarLink"})
     if author_link:
         author_store_url = author_link.get('href', '')
         if not author_store_url.startswith('http'):
             author_store_url = 'https://www.teacherspayteachers.com' + author_store_url
-        author_name = author_link.get_text(strip=True)
+        avatar = author_link.find(attrs={"data-testid": "authorAvatar"})
+        if avatar:
+            author_name = avatar.get('aria-label', '').strip() or None
     
     # Extract follower count from the AboutAuthorRow follow container
     # The container combines "Follow", count, and "Followers" across child elements,
@@ -494,7 +513,7 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     
     # Extract product ID from URL
     product_id = None
-    id_match = re.search(r'/Product/[^/]+-?(\d+)(?:\?|$)', url)
+    id_match = re.search(r'/Product/[^/]+-(\d+)(?:\?|$)', url)
     if id_match:
         product_id = id_match.group(1)
     
@@ -503,7 +522,10 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     return (url, product_id, title, short_description, long_description, rating_value, number_of_ratings, 
             product_price, preview_keywords, author_name, author_store_url, author_follower_count)
 
-async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 25, rescrape: bool = False, no_cache: bool = False):
+async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 8,
+                          rescrape: bool = False, no_cache: bool = False,
+                          batch_size: int = 100, sleep_min: float = 1.0, sleep_max: float = 3.0,
+                          max_rate_limit_delay: float = 30.0):
     """
     Scrape metadata for all URLs found in search.
     
@@ -571,8 +593,7 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
         )
     
     async with session_context as session:
-        
-        batch_size = 100
+
         scraped_count = 0
         failed_count = 0
         start_time = time.time()
@@ -638,7 +659,7 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
             
             # Sleep between batches
             if i + batch_size < len(urls_to_scrape):
-                await asyncio.sleep(random.uniform(1, 3))
+                await asyncio.sleep(random.uniform(sleep_min, sleep_max))
     
     total_elapsed = time.time() - start_time
     logging.info(f"=" * 60)
@@ -651,7 +672,7 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
 # 2b. DEEP SCRAPE (Playwright)
 ###########################
 
-async def deep_scrape_oldest_review(url: str, browser, session_file: str = "tpt_storage.json") -> Optional[str]:
+async def deep_scrape_oldest_review(url: str, browser, session_file: str = "tpt_storage.json") -> Tuple[Optional[str], bool]:
     """
     Use Playwright to load a product page, click through all reviews,
     and extract the oldest review date.
@@ -886,54 +907,102 @@ def extract_product_id(url: str) -> str:
     # Fallback to URL hash
     return str(abs(hash(url)) % (10 ** 8))
 
-async def download_free_file(product_url: str, session_file: str = "tpt_storage.json", 
-                            downloads_dir: Path = Path("downloads"), max_retries: int = 3):
-    """Download a free file from TPT into a product-specific folder."""
+class SessionExpiredError(Exception):
+    """Raised when the TPT session cookie has expired. Aborts the entire download run."""
+    pass
+
+
+async def download_free_file(product_url: str, browser, session_file: str,
+                             downloads_dir: Path) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Download a single free product using a shared Playwright browser.
+
+    Returns (file_path, file_size, failure_reason).
+    failure_reason is None on success.
+    Raises SessionExpiredError if the auth cookie needs to be refreshed.
+    """
     free_url = product_url.replace("/Product/", "/FreeDownload/")
-    
-    # Create product-specific folder using product ID
     product_id = extract_product_id(product_url)
     product_dir = downloads_dir / product_id
     product_dir.mkdir(parents=True, exist_ok=True)
-    
-    for attempt in range(1, max_retries + 1):
+
+    context = None
+    try:
+        context = await browser.new_context(storage_state=session_file, accept_downloads=True)
+        page = await context.new_page()
+
+        # Auto-dismiss any modal dialogs that would block the download
+        page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
+
+        logging.info(f"[{product_id}] Downloading {free_url}")
+
+        # Attempt 1: direct-download navigation (most products trigger immediately)
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    storage_state=session_file,
-                    accept_downloads=True
+            async with page.expect_download(timeout=15000) as dl_info:
+                await page.goto(free_url, wait_until="domcontentloaded", timeout=30000)
+            download = await dl_info.value
+
+        except Exception:
+            # Download did not auto-start — inspect the landing page
+            current_url = page.url
+
+            # Detect session expiry (redirect to login / request-authorization)
+            if any(tok in current_url.lower() for tok in
+                   ("login", "signin", "sign-in", "request-authorization")):
+                raise SessionExpiredError(
+                    f"Session expired (redirected to {current_url[:80]}). "
+                    "Re-run create_session.py to refresh tpt_storage.json."
                 )
-                page = await context.new_page()
-                
-                logging.info(f"[{product_id}] Attempt {attempt}: Downloading {free_url}")
-                async with page.expect_download() as download_info:
-                    await page.goto(free_url)
-                
-                download = await download_info.value
-                suggested_name = download.suggested_filename
-                
-                # Save to product folder with original filename
-                save_path = product_dir / suggested_name
-                await download.save_as(save_path)
-                
-                # Verify file
-                if not save_path.exists() or save_path.stat().st_size == 0:
-                    raise Exception("Downloaded file is empty or missing")
-                
-                file_size = save_path.stat().st_size
-                logging.info(f"[{product_id}] ✅ Downloaded: {save_path.name} ({file_size:,} bytes)")
-                
-                await browser.close()
-                return str(save_path), file_size, product_dir
-                
-        except Exception as e:
-            logging.warning(f"[{product_id}] Attempt {attempt} failed: {e}")
-            if attempt == max_retries:
-                logging.error(f"[{product_id}] Failed after {max_retries} attempts")
-            await asyncio.sleep(2)
-    
-    return None, None, None
+
+            # Attempt 2: look for an explicit Download button on the page
+            btn = page.locator(
+                '[data-testid="download-button-cta"], [data-testid="download-button"]'
+            ).first
+            try:
+                btn_visible = await btn.is_visible(timeout=3000)
+            except Exception:
+                btn_visible = False
+
+            if btn_visible:
+                logging.info(f"[{product_id}] Clicking download button")
+                async with page.expect_download(timeout=30000) as dl_info:
+                    await btn.click()
+                download = await dl_info.value
+            else:
+                # Last-resort: check page text for a sign-in wall
+                try:
+                    body_text = (await page.inner_text("body"))[:400].lower()
+                except Exception:
+                    body_text = ""
+                if "sign in" in body_text or "log in" in body_text:
+                    raise SessionExpiredError(
+                        "Session expired (sign-in wall detected). "
+                        "Re-run create_session.py to refresh tpt_storage.json."
+                    )
+                return None, None, f"no_download_triggered (landed on {current_url[:80]})"
+
+        filename = download.suggested_filename
+        save_path = product_dir / filename
+        await download.save_as(save_path)
+
+        if not save_path.exists() or save_path.stat().st_size == 0:
+            return None, None, "empty_file"
+
+        file_size = save_path.stat().st_size
+        logging.info(f"[{product_id}] Downloaded: {save_path.name} ({file_size:,} bytes)")
+        return str(save_path), file_size, None
+
+    except SessionExpiredError:
+        raise  # propagate to abort the run
+    except Exception as e:
+        logging.warning(f"[{product_id}] Download failed: {e}")
+        return None, None, str(e)[:200]
+    finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 def extract_zip_in_place(zip_path: Path) -> bool:
     """Extract a zip file in its containing folder and optionally remove the zip."""
@@ -947,31 +1016,34 @@ def extract_zip_in_place(zip_path: Path) -> bool:
         logging.warning(f"Failed to extract {zip_path.name}: {e}")
         return False
 
-async def download_free_products(config_name: str, db_file: str, 
+async def download_free_products(config_name: str, db_file: str,
                                 filters: Optional[Dict[str, Any]] = None,
                                 session_file: str = "tpt_storage.json",
                                 concurrent_downloads: int = 5,
                                 use_queue: bool = False,
-                                auto_extract: bool = False):
+                                auto_extract: bool = True):
     """
     Download all free products found in search that match filters.
-    
+
     Args:
         config_name: Configuration name
         db_file: Database file
-        filters: Optional filters (e.g., {"resource_type": "teacher-tools", "subject": "classroom-management"})
+        filters: Optional filters (e.g., {"resource_type": "teacher-tools"})
         session_file: Playwright session file for authentication
         concurrent_downloads: Number of concurrent downloads
         use_queue: If True, only download products in the download_queue table
+        top_n: If set, only download the top N products by number of ratings
     """
     logging.info(f"=" * 60)
     logging.info(f"DOWNLOAD FREE FILES WORKFLOW - Configuration: {config_name}")
     if use_queue:
         logging.info(f"MODE: Using download_queue table")
+    if top_n:
+        logging.info(f"MODE: Top {top_n:,} products by rating count")
     logging.info(f"=" * 60)
-    
+
     downloads_dir = Path(f"downloads_{config_name}")
-    
+
     # Build query based on mode
     if use_queue:
         # Download from manually populated queue
@@ -983,14 +1055,14 @@ async def download_free_products(config_name: str, db_file: str,
         """
         params = []
     else:
-        # Original behavior - download all free products matching filters
+        # Download free products matching filters, optionally limited to top N by ratings
         query = """
             SELECT DISTINCT s.url, m.product_price
             FROM search_results s
             JOIN product_metadata m ON s.url = m.url
             WHERE s.price_option = 'free'
         """
-        
+
         params = []
         if filters:
             conditions = []
@@ -1002,9 +1074,12 @@ async def download_free_products(config_name: str, db_file: str,
                 else:
                     conditions.append(f"s.{key} = ?")
                     params.append(value)
-            
             if conditions:
                 query += " AND " + " AND ".join(conditions)
+
+        query += " ORDER BY CAST(m.number_of_ratings AS INTEGER) DESC"
+        if top_n:
+            query += f" LIMIT {top_n}"
     
     # Get URLs to download
     async with aiosqlite.connect(db_file) as db:
@@ -1033,51 +1108,108 @@ async def download_free_products(config_name: str, db_file: str,
     if filters:
         logging.info(f"Filters applied: {filters}")
     
-    # Download
-    semaphore = asyncio.Semaphore(concurrent_downloads)
-    
-    async def download_with_sem(url):
-        async with semaphore:
-            return await download_free_file(url, session_file, downloads_dir)
-    
+    # DB migration: add failure_reason column if not present
+    async with aiosqlite.connect(db_file) as db:
+        async with db.execute("PRAGMA table_info(downloads)") as cursor:
+            existing_cols = {row[1] for row in await cursor.fetchall()}
+        if "failure_reason" not in existing_cols:
+            await db.execute("ALTER TABLE downloads ADD COLUMN failure_reason TEXT")
+            await db.commit()
+            logging.info("Migration: added failure_reason column to downloads")
+
+    # Download using a single shared browser for all products
     success_count = 0
     fail_count = 0
     extracted_count = 0
-    
-    for i, (url, price) in enumerate(urls_to_download, 1):
-        logging.info(f"Processing {i}/{len(urls_to_download)}: {url}")
-        
-        file_path, file_size, product_dir = await download_with_sem(url)
-        
-        if file_path:
-            # Store in database
+    session_expired = False
+    semaphore = asyncio.Semaphore(concurrent_downloads)
+    start_time = time.time()
+    total = len(urls_to_download)
+
+    async def download_one(url: str):
+        """Download one product with semaphore and session-expiry propagation."""
+        nonlocal session_expired
+        if session_expired:
+            return url, None, None, "aborted_session_expired"
+        async with semaphore:
+            try:
+                file_path, file_size, reason = await download_free_file(
+                    url, browser, session_file, downloads_dir
+                )
+                return url, file_path, file_size, reason
+            except SessionExpiredError as e:
+                session_expired = True
+                logging.error(str(e))
+                return url, None, None, "session_expired"
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        logging.info("Browser launched (shared across all downloads)")
+
+        batch_size = 10
+        for i in range(0, total, batch_size):
+            if session_expired:
+                remaining_count = total - i
+                logging.error(
+                    f"Session expired — stopping ({remaining_count} products not downloaded). "
+                    "Run create_session.py then re-run download to resume."
+                )
+                break
+
+            batch_urls = [url for url, _ in urls_to_download[i:i + batch_size]]
+            tasks = [download_one(url) for url in batch_urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
             async with aiosqlite.connect(db_file) as db:
-                await db.execute("""
-                    INSERT OR IGNORE INTO downloads (product_url, file_path, file_size)
-                    VALUES (?, ?, ?)
-                """, (url, file_path, file_size))
+                for result in results:
+                    if isinstance(result, Exception):
+                        fail_count += 1
+                        continue
+                    url, file_path, file_size, failure_reason = result
+                    if file_path:
+                        await db.execute("""
+                            INSERT OR REPLACE INTO downloads
+                                (product_url, file_path, file_size, failure_reason)
+                            VALUES (?, ?, ?, NULL)
+                        """, (url, file_path, file_size))
+                        success_count += 1
+                        if file_path.endswith(".zip"):
+                            if extract_zip_in_place(Path(file_path)):
+                                extracted_count += 1
+                    else:
+                        await db.execute("""
+                            INSERT OR REPLACE INTO downloads
+                                (product_url, file_path, file_size, failure_reason)
+                            VALUES (?, NULL, NULL, ?)
+                        """, (url, failure_reason))
+                        fail_count += 1
                 await db.commit()
-            success_count += 1
-            
-            # Auto-extract zips if requested
-            if auto_extract and file_path.endswith('.zip'):
-                if extract_zip_in_place(Path(file_path)):
-                    extracted_count += 1
-        else:
-            fail_count += 1
-        
-        # Small delay between downloads
-        if i < len(urls_to_download):
-            await asyncio.sleep(random.uniform(2, 5))
-    
-    logging.info(f"=" * 60)
-    logging.info(f"DOWNLOAD COMPLETE")
+
+            # Progress
+            processed = min(i + batch_size, total)
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            eta = (total - processed) / rate if rate > 0 else 0
+            logging.info(
+                f"Progress: {processed:,}/{total:,} ({processed * 100 // total}%) "
+                f"| OK: {success_count:,} | Fail: {fail_count:,} "
+                f"| Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s "
+                f"| ETA: {int(eta // 60)}m {int(eta % 60)}s"
+            )
+
+            if i + batch_size < total and not session_expired:
+                await asyncio.sleep(random.uniform(1, 3))
+
+        await browser.close()
+        logging.info("Browser closed")
+
+    logging.info("=" * 60)
+    logging.info("DOWNLOAD COMPLETE")
     logging.info(f"Successful: {success_count:,}")
-    if auto_extract:
-        logging.info(f"Extracted: {extracted_count:,}")
+    logging.info(f"Extracted zips: {extracted_count:,}")
     logging.info(f"Failed: {fail_count:,}")
     logging.info(f"Files saved to: {downloads_dir}")
-    logging.info(f"=" * 60)
+    logging.info("=" * 60)
 
 ###########################
 # CLI Interface           #
@@ -1163,7 +1295,16 @@ async def cmd_scrape(args):
     
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
-    await scrape_metadata(args.config, db_file, config.get("concurrent_requests", 25), args.rescrape, args.no_cache)
+    await scrape_metadata(
+        args.config, db_file,
+        concurrent_requests=config.get("concurrent_requests", 8),
+        rescrape=args.rescrape,
+        no_cache=args.no_cache,
+        batch_size=config.get("batch_size", 100),
+        sleep_min=config.get("sleep_between_batches", [1.0, 3.0])[0],
+        sleep_max=config.get("sleep_between_batches", [1.0, 3.0])[1],
+        max_rate_limit_delay=config.get("max_rate_limit_delay", 30.0),
+    )
 
 async def cmd_deepscrape(args):
     """Run deep scrape workflow to find oldest review dates."""
@@ -1195,8 +1336,8 @@ async def cmd_download(args):
     
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
-    await download_free_products(args.config, db_file, filters, args.session_file, 
-                                args.concurrent, args.use_queue, args.extract)
+    await download_free_products(args.config, db_file, filters, args.session_file,
+                                args.concurrent, args.use_queue, top_n=args.top)
 
 async def cmd_stats(args):
     """Show statistics for a configuration."""
@@ -1217,10 +1358,13 @@ async def cmd_stats(args):
             metadata_count = (await cursor.fetchone())[0]
         
         # Downloads
-        async with db.execute("SELECT COUNT(*), SUM(file_size) FROM downloads") as cursor:
+        async with db.execute("SELECT COUNT(*), SUM(file_size) FROM downloads WHERE file_path IS NOT NULL") as cursor:
             row = await cursor.fetchone()
             downloads_count = row[0]
             total_size = row[1] or 0
+
+        async with db.execute("SELECT COUNT(*) FROM downloads WHERE failure_reason IS NOT NULL") as cursor:
+            failed_downloads = (await cursor.fetchone())[0]
         
         # Free products available
         async with db.execute("""
@@ -1238,6 +1382,7 @@ async def cmd_stats(args):
     print(f"Metadata scraped:         {metadata_count:,}")
     print(f"Free products available:  {free_products:,}")
     print(f"Files downloaded:         {downloads_count:,}")
+    print(f"Download failures:        {failed_downloads:,}")
     print(f"Total download size:      {total_size:,} bytes ({total_size / 1024 / 1024:.1f} MB)")
     print(f"{'='*60}\n")
 
@@ -1306,9 +1451,10 @@ Examples:
     download_parser.add_argument("config", help="Configuration name")
     download_parser.add_argument("--filter", action="append", help="Filter (e.g., resource_type=teacher-tools)")
     download_parser.add_argument("--session-file", default="tpt_storage.json", help="Playwright session file")
-    download_parser.add_argument("--concurrent", type=int, default=5, help="Concurrent downloads")
+    download_parser.add_argument("--concurrent", type=int, default=3, help="Concurrent downloads")
+    download_parser.add_argument("--top", type=int, default=None, metavar="N",
+                                 help="Only download the top N products by number of ratings")
     download_parser.add_argument("--use-queue", action="store_true", help="Download only products in download_queue table")
-    download_parser.add_argument("--extract", action="store_true", help="Auto-extract zip files after download")
     
     # Stats
     stats_parser = subparsers.add_parser("stats", help="Show statistics")

@@ -7,6 +7,9 @@ tpt_storage.json
 downloads_*/
 sample_page.html
 *.db-journal
+test_pipeline.db
+aiohttp_cache*
+.venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
