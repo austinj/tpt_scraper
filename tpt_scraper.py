@@ -130,8 +130,9 @@ async def setup_db(db_file: str):
 ###########################
 
 class AdaptiveRateLimiter:
-    """Adaptive rate limiter that adjusts based on response times and errors."""
-    
+    """Adaptive rate limiter that adjusts based on response times and errors.
+    Uses a lock so concurrent tasks are dispatched sequentially, not in bursts."""
+
     def __init__(self, initial_delay=1.0, max_delay=30.0, error_threshold=0.1):
         self.current_delay = initial_delay
         self.max_delay = max_delay
@@ -139,34 +140,37 @@ class AdaptiveRateLimiter:
         self.recent_responses = deque(maxlen=100)
         self.error_count = 0
         self.total_count = 0
-        
+        self._lock = asyncio.Lock()  # serialises request dispatch
+
     def record_response(self, success: bool, response_time: float):
         """Record a response and its timing."""
         self.recent_responses.append((success, response_time, time.time()))
         self.total_count += 1
         if not success:
             self.error_count += 1
-            
+
     def adjust_delay(self):
         """Adjust delay based on recent performance."""
         if len(self.recent_responses) < 10:
             return self.current_delay
-            
+
         recent_errors = sum(1 for success, _, _ in self.recent_responses if not success)
         error_rate = recent_errors / len(self.recent_responses)
         avg_response_time = sum(rt for _, rt, _ in self.recent_responses) / len(self.recent_responses)
-        
+
         if error_rate > self.error_threshold:
             self.current_delay = min(self.current_delay * 1.5, self.max_delay)
         elif error_rate < self.error_threshold / 2 and avg_response_time < 2.0:
             self.current_delay = max(self.current_delay * 0.9, 0.1)
-            
+
         return self.current_delay
-        
+
     async def wait(self):
-        """Wait for the current delay period."""
-        delay = self.adjust_delay()
-        await asyncio.sleep(delay)
+        """Acquire the lock, sleep for the current delay, then release.
+        This ensures requests are staggered even under high concurrency."""
+        async with self._lock:
+            delay = self.adjust_delay()
+            await asyncio.sleep(delay)
 
 ###########################
 # URL Building and Fetch  #
@@ -198,7 +202,7 @@ BROWSER_HEADERS = {
                   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -237,16 +241,113 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
                     else:
                         if rate_limiter:
                             rate_limiter.record_response(False, response_time)
+                        logging.warning(f"Unexpected HTTP {response.status} for {url}")
                         return None
-                        
+
         except Exception as e:
             retries += 1
+            logging.debug(f"Fetch attempt {retries}/{max_retries} failed for {url}: {e}")
             if retries < max_retries:
                 await asyncio.sleep(backoff)
                 backoff *= 2
                 
     logging.error(f"Failed to fetch {url} after {max_retries} retries")
     return None
+
+###########################
+# Pre-flight check        #
+###########################
+
+async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
+    """
+    Test one URL per unique base combination (grade×subject×price) before the full search.
+
+    Returns (ok, bad_keys) where:
+      - ok=False  → hard failure (403/429/connection error); caller should abort
+      - ok=True   → proceed; bad_keys is the set of base-combo tuples to skip
+    """
+    resource_types = config.get("resource_type", [""])
+    grade_levels   = config.get("grade_level", [""])
+    subjects       = config.get("subject", [""])
+    formats        = config.get("format", [""])
+    price_options  = config.get("price_options", [""])
+    supports_list  = config.get("supports", [""])
+    sort           = config.get("sorting_methods", ["Relevance"])[0]
+
+    probe_urls: Dict[tuple, str] = {}
+    for rt in resource_types:
+        for gl in grade_levels:
+            for sub in subjects:
+                for fmt in formats:
+                    for price in price_options:
+                        for sup in supports_list:
+                            key = (rt, gl, sub, fmt, price, sup)
+                            probe_urls[key] = build_page_url(
+                                rt, gl, sub, fmt, price, sup, sort, 1
+                            )
+
+    logging.info(f"Pre-flight: testing {len(probe_urls)} unique URL combinations...")
+
+    HARD_FAIL = {403, 429, 503}
+    bad_keys: set = set()
+    SELECTOR = "a.ProductRowCard-module__cardTitleLink--YPqiC"
+
+    async with aiohttp.ClientSession() as session:
+        for key, url in probe_urls.items():
+            try:
+                async with async_timeout.timeout(15):
+                    async with session.get(
+                        url, headers=BROWSER_HEADERS, allow_redirects=True
+                    ) as resp:
+                        status = resp.status
+                        if status in HARD_FAIL:
+                            logging.error(
+                                f"Pre-flight HARD FAIL HTTP {status}: {url}\n"
+                                f"  Looks like this IP is rate-limited or blocked. "
+                                f"Wait a few minutes then try again."
+                            )
+                            return False, set()
+                        elif status == 404:
+                            logging.warning(f"Pre-flight 404 — skipping: {url}")
+                            bad_keys.add(key)
+                        elif status == 200:
+                            html = await resp.text()
+                            count = len(BeautifulSoup(html, "lxml").select(SELECTOR))
+                            if count == 0:
+                                logging.warning(
+                                    f"Pre-flight 200 but 0 products — skipping: {url}"
+                                )
+                                bad_keys.add(key)
+                            else:
+                                logging.info(
+                                    f"Pre-flight OK ({count} products): {url}"
+                                )
+                        else:
+                            logging.warning(
+                                f"Pre-flight HTTP {status} — skipping: {url}"
+                            )
+                            bad_keys.add(key)
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                logging.error(
+                    f"Pre-flight connection error: {e}\n"
+                    f"  URL: {url}\n"
+                    f"  Check network and try again."
+                )
+                return False, set()
+
+    good = len(probe_urls) - len(bad_keys)
+    logging.info(
+        f"Pre-flight complete: {good}/{len(probe_urls)} valid"
+        + (f", {len(bad_keys)} skipped (404/empty)" if bad_keys else "")
+    )
+
+    if good == 0:
+        logging.error("Pre-flight: no valid URL combinations. Check your config.")
+        return False, set()
+
+    return True, bad_keys
+
 
 ###########################
 # 1. SEARCH WORKFLOW      #
@@ -260,7 +361,7 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
     logging.info(f"=" * 60)
     logging.info(f"SEARCH WORKFLOW - Configuration: {config_name}")
     logging.info(f"=" * 60)
-    
+
     # Extract configuration
     resource_types = config.get("resource_type", [""])
     grade_levels = config.get("grade_level", [""])
@@ -287,6 +388,22 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
         for sort_order in sorting_methods
         for page in range(1, total_pages + 1)
     ]
+
+    # Pre-flight: verify base URLs before committing to the full run
+    ok, bad_keys = await preflight_check(config)
+    if not ok:
+        logging.error("Search aborted due to pre-flight failure.")
+        return
+    if bad_keys:
+        before = len(combinations)
+        combinations = [
+            c for c in combinations
+            if (c[0], c[1], c[2], c[3], c[4], c[5]) not in bad_keys
+        ]
+        logging.info(
+            f"Pre-flight filtered {before - len(combinations):,} combinations "
+            f"({len(combinations):,} remaining)"
+        )
     
     # Check what's already been searched
     async with aiosqlite.connect(db_file) as db:
@@ -1021,7 +1138,8 @@ async def download_free_products(config_name: str, db_file: str,
                                 session_file: str = "tpt_storage.json",
                                 concurrent_downloads: int = 5,
                                 use_queue: bool = False,
-                                auto_extract: bool = True):
+                                auto_extract: bool = True,
+                                top_n: Optional[int] = None):
     """
     Download all free products found in search that match filters.
 
@@ -1357,14 +1475,17 @@ async def cmd_stats(args):
         async with db.execute("SELECT COUNT(*) FROM product_metadata") as cursor:
             metadata_count = (await cursor.fetchone())[0]
         
-        # Downloads
+        # Downloads — failure_reason column added by migration; may not exist on older DBs
         async with db.execute("SELECT COUNT(*), SUM(file_size) FROM downloads WHERE file_path IS NOT NULL") as cursor:
             row = await cursor.fetchone()
             downloads_count = row[0]
             total_size = row[1] or 0
 
-        async with db.execute("SELECT COUNT(*) FROM downloads WHERE failure_reason IS NOT NULL") as cursor:
-            failed_downloads = (await cursor.fetchone())[0]
+        try:
+            async with db.execute("SELECT COUNT(*) FROM downloads WHERE failure_reason IS NOT NULL") as cursor:
+                failed_downloads = (await cursor.fetchone())[0]
+        except Exception:
+            failed_downloads = 0
         
         # Free products available
         async with db.execute("""

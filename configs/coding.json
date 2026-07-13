@@ -40,13 +40,16 @@
     "Most-Recent"
   ],
   "total_pages": 42,
-  "concurrent_requests": 8,
+  "concurrent_requests": 3,
   "batch_size": 75,
-  "sleep_between_batches": [1.0, 3.0],
+  "sleep_between_batches": [
+    1.0,
+    3.0
+  ],
   "max_rate_limit_delay": 30.0,
   "_metadata": {
     "created": "2026-01-07T11:10:51.502490",
     "description": "Free classroom management materials for all grades",
-    "last_used": "2026-02-11T17:18:24.506655"
+    "last_used": "2026-07-10T20:49:36.248350"
   }
 }
