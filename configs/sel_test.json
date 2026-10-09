@@ -1,0 +1,43 @@
+{
+  "resource_type": [
+    ""
+  ],
+  "grade_level": [
+    "elementary"
+  ],
+  "subject": [
+    "social-emotional/social-emotional-learning"
+  ],
+  "format": [
+    ""
+  ],
+  "price_options": [
+    ""
+  ],
+  "supports": [
+    ""
+  ],
+  "sorting_methods": [
+    "Relevance",
+    "Rating",
+    "Rating-Count"
+  ],
+  "total_pages": 20,
+  "concurrent_requests": 10,
+  "max_retries": 2,
+  "sleep_between_batches": [
+    0.5,
+    2.0
+  ],
+  "download_sleep": [
+    1,
+    3
+  ],
+  "batch_size": 50,
+  "enable_adaptive_rate_limiting": true,
+  "_metadata": {
+    "created": "2026-10-09T13:50:15.287755",
+    "description": "20-page smoke test",
+    "last_used": "2026-10-09T14:40:43.971876"
+  }
+}

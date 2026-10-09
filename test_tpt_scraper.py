@@ -189,6 +189,49 @@ class TestDatabaseSetup:
                 assert 'idx_metadata_url' in index_names
                 assert 'idx_queue_priority' in index_names
 
+    @pytest.mark.asyncio
+    async def test_search_hits_and_overlap_view(self, temp_db_file):
+        """search_hits keeps one row per appearance; the view aggregates overlap per product."""
+        await scraper.setup_db(temp_db_file)
+        async with aiosqlite.connect(temp_db_file) as db:
+            for name in ("search_hits", "product_search_summary"):
+                async with db.execute("SELECT name FROM sqlite_master WHERE name=?", (name,)) as cur:
+                    assert await cur.fetchone() is not None, name
+
+            base = ("", "elementary", "social-emotional", "", "", "")
+            rows = [
+                ("111", "https://x/Product/a-111", *base, "Relevance", 1, 3),
+                ("111", "https://x/Product/a-111", *base, "Rating", 2, 7),      # same product, other sort
+                ("111", "https://x/Product/a-111", *base, "Rating", 2, 7),      # exact duplicate -> ignored
+                ("222", "https://x/Product/b-222", *base, "Relevance", 1, 4),
+            ]
+            await db.executemany("""
+                INSERT OR IGNORE INTO search_hits
+                (product_id, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, rank_on_page)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            await db.commit()
+
+            async with db.execute("SELECT COUNT(*) FROM search_hits") as cur:
+                assert (await cur.fetchone())[0] == 3
+            async with db.execute("""SELECT n_hits, n_sort_orders, best_page, best_position, sort_orders
+                                     FROM product_search_summary WHERE product_id='111'""") as cur:
+                n_hits, n_sorts, best_page, best_pos, sorts = await cur.fetchone()
+            assert (n_hits, n_sorts, best_page, best_pos) == (2, 2, 1, 1003)
+            assert set(sorts.split(",")) == {"Relevance", "Rating"}
+
+    @pytest.mark.asyncio
+    async def test_search_results_product_id_backfill(self, temp_db_file):
+        """Pre-existing search_results rows get product_id filled in on setup."""
+        async with aiosqlite.connect(temp_db_file) as db:
+            await db.execute("""CREATE TABLE search_results (url TEXT PRIMARY KEY, resource_type TEXT, grade_level TEXT,
+                                subject TEXT, format TEXT, price_option TEXT, supports TEXT, sort_order TEXT, page INTEGER)""")
+            await db.execute("INSERT INTO search_results (url, price_option) VALUES ('https://www.teacherspayteachers.com/Product/--10158553', 'free')")
+            await db.commit()
+        await scraper.setup_db(temp_db_file)
+        async with aiosqlite.connect(temp_db_file) as db:
+            async with db.execute("SELECT product_id FROM search_results") as cur:
+                assert (await cur.fetchone())[0] == "10158553"
+
 
 class TestAdaptiveRateLimiter:
     """Test the AdaptiveRateLimiter class."""
@@ -326,6 +369,42 @@ class TestSearchWorkflow:
                 expected_combos = 1 * 1 * 1 * 1 * 1 * 1 * 1 * 2  # = 2 combinations
                 assert expected_combos == 2
 
+    @pytest.mark.asyncio
+    async def test_check_sort_orders_drops_ignored_sorts(self):
+        """A sort whose page-1 sequence equals Relevance is dropped; distinct ones are kept."""
+        def page(ids):
+            links = "".join(f'<a class="ProductRowCard-module__cardTitleLink--abc" href="/Product/t-{i}"></a>' for i in ids)
+            return f"<html><body>{links}</body></html>"
+        by_sort = {
+            None: page([1, 2, 3]),             # Relevance (no order= param)
+            "Rating": page([3, 1, 2]),
+            "Rating-Count": page([1, 2, 3]),   # ignored by server -> same as Relevance
+            "Price-Asc": page([2, 3, 1]),
+        }
+
+        class _Resp:
+            def __init__(self, body): self.status, self._body = 200, body
+            async def text(self): return self._body
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class _Session:
+            def get(self, url, headers=None, allow_redirects=True):
+                import urllib.parse as up
+                q = up.parse_qs(up.urlparse(url).query)
+                return _Resp(by_sort[q.get("order", [None])[0]])
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        config = {"sorting_methods": ["Relevance", "Rating", "Rating-Count", "Price-Asc"]}
+        with patch("tpt_scraper.aiohttp.ClientSession", return_value=_Session()), \
+             patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
+            kept = await scraper.check_sort_orders(config, [("", "elementary", "social-emotional", "", "", "")])
+        assert kept == ["Relevance", "Rating", "Price-Asc"]
+
+        # Single sort order: nothing to compare, returned unchanged without any requests
+        assert await scraper.check_sort_orders({"sorting_methods": ["Relevance"]}, [("", "", "", "", "", "")]) == ["Relevance"]
+
 
 class TestScrapeMetadata:
     """Test metadata scraping functionality."""
@@ -371,9 +450,156 @@ class TestScrapeMetadata:
             )
             
             assert result is not None
-            assert len(result) == 8  # Should return 8-tuple
-            assert result[0] == "Test Product"  # title
-            assert result[1] == "Test description"  # short_description
+            assert isinstance(result, dict)
+            assert list(result.keys()) == scraper.METADATA_COLUMNS
+            assert result["title"] == "Test Product"
+            assert result["short_description"] == "Test description"
+            assert result["product_id"] is None  # URL has no numeric id
+            assert result["post_date"] is None   # no Apollo state in this page
+
+    def test_extract_product_id(self):
+        assert scraper.extract_product_id("https://www.teacherspayteachers.com/Product/Some-Title-1234567") == "1234567"
+        assert scraper.extract_product_id("https://www.teacherspayteachers.com/Product/--10158553") == "10158553"
+        assert scraper.extract_product_id("https://www.teacherspayteachers.com/Product/Title-99?ref=x") == "99"
+        assert scraper.extract_product_id("https://www.teacherspayteachers.com/Product/test") is None
+
+    def test_extract_product_details_from_apollo_state(self):
+        html = '<html><script>window.__DATA__={"foo":1,"apolloState":' + json.dumps({
+            "Store:188690": {"__typename": "Store", "id": "188690", "followerCount": 51049, "totalItems": 385},
+            "Product:263126": {
+                "__typename": "Product", "id": "263126", "postDate": "2012-06-20 22:45:24",
+                "itemType": "DIGITAL_PRODUCT", "kind": "ZIP", "isFree": False,
+                "filePreview": {"filesize": 23392631, "pageCount": "35+ Pages"},
+                "prices": {"isFree": False, "nonTransferableLicense": {
+                    "price": "$6.00", "discountPrice": "$0.00", "salePrice": "$0.00", "additionalLicensePrice": "$4.80"}},
+                "taxonomyTags": [{"__ref": "ResourceTaxonomyTag:3rd-grade"}, {"__ref": "ResourceTaxonomyTag:pdf"}],
+                "commonCoreStandards": [], "answerKey": "NA", "teachingDuration": "NA",
+                "includedIn": [{"__ref": "Product:3944049"}], "images": [{}, {}, {}],
+                "previewVideo": None, "mainVideo": {"url": "x"},
+                "evaluationRating": {"count": 11530, "v1EvaluationsCount": 2026, "scoreAverage": "4.77"},
+                "author": {"__ref": "Store:188690"},
+            },
+            "ROOT_QUERY": {"__typename": "Query", "filterEvaluationsByResource({\"resourceId\":\"263126\"})": {
+                "totalCount": 10000,
+                "facets": {"__typename": "EvaluationFacets",
+                           "starRatingGroup": [{"value": "4", "count": 874}, {"value": "5", "count": 10596}],
+                           "whichGradeUsedWith": [{"value": "3", "count": 679}]}}},
+        }) + ',"other":2};</script></html>'
+
+        state = scraper.extract_apollo_state(html)
+        assert state is not None and "Product:263126" in state
+
+        d = scraper.extract_product_details(state, "263126")
+        assert set(d.keys()) == set(scraper.PRODUCT_DETAIL_COLUMNS)
+        assert d["post_date"] == "2012-06-20 22:45:24"
+        assert d["item_type"] == "DIGITAL_PRODUCT"
+        assert d["file_kind"] == "ZIP"
+        assert d["file_size_bytes"] == 23392631
+        assert d["page_count"] == "35+ Pages"
+        assert (d["price_full"], d["price_discount"], d["price_additional_license"]) == ("$6.00", "$0.00", "$4.80")
+        assert d["is_free"] == 0
+        assert d["taxonomy_tags"] == "3rd-grade, pdf"
+        assert d["common_core_standards"] is None
+        assert d["bundle_count"] == 1
+        assert d["image_count"] == 3
+        assert (d["has_preview_video"], d["has_main_video"]) == (0, 1)
+        assert (d["store_id"], d["store_follower_count"], d["store_total_items"]) == ("188690", 51049, 385)
+        assert d["v1_evaluations_count"] == 2026
+        assert json.loads(d["rating_distribution"]) == {"4": 874, "5": 10596}
+        assert json.loads(d["evaluation_facets"]) == {"starRatingGroup": {"4": 874, "5": 10596},
+                                                      "whichGradeUsedWith": {"3": 679}}
+
+        # Falls back to the Product entry that has postDate when the id doesn't match
+        assert scraper.extract_product_details(state, "999")["post_date"] == "2012-06-20 22:45:24"
+        # Degrades to all-None without Apollo state
+        assert all(v is None for v in scraper.extract_product_details(None, "263126").values())
+        assert scraper.extract_apollo_state("<html>no state</html>") is None
+
+
+class TestFirstReviewDate:
+    """Test the GraphQL-based first-review lookup with a fake session."""
+
+    @staticmethod
+    def _make_session(pages_by_after):
+        """pages_by_after maps the `after` cursor -> connection dict (or Exception)."""
+        calls = []
+
+        class _Resp:
+            def __init__(self, body):
+                self.status = 200
+                self.headers = {}
+                self._body = body
+            async def json(self, content_type=None):
+                return self._body
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def post(self, url, json=None, headers=None):
+                after = json["variables"]["after"]
+                calls.append(after)
+                page = pages_by_after.get(after)
+                if page is None:
+                    page = {"totalCount": 0, "pageInfo": {"hasNextPage": False, "lastCursor": None}, "edges": []}
+                return _Resp({"data": {"filterEvaluationsByResource": page}})
+
+        return _Session(), calls
+
+    @staticmethod
+    def _page(dates, has_next=False, last_cursor=None):
+        return {"totalCount": len(dates),
+                "pageInfo": {"hasNextPage": has_next, "lastCursor": last_cursor},
+                "edges": [{"cursor": "x", "node": {"createdAt": d}} for d in dates]}
+
+    def test_cursor_encoding(self):
+        assert scraper.encode_evaluations_cursor(0) is None
+        assert scraper.encode_evaluations_cursor(8) == "OA=="
+        assert scraper.encode_evaluations_cursor(9997) == "OTk5Nw=="
+
+    @pytest.mark.asyncio
+    async def test_single_jump(self):
+        # 632 reviews -> jump to offset 532 and read the tail in one call
+        session, calls = self._make_session({
+            scraper.encode_evaluations_cursor(532): self._page(
+                ["2016-05-01T00:00:00.000Z", "2016-04-14T09:00:00.000Z", "2016-04-20T00:00:00.000Z"]),
+        })
+        date, status = await scraper.fetch_first_review_date(session, "2495504", 632)
+        assert (date, status) == ("2016-04-14", "ok")
+        assert calls == [scraper.encode_evaluations_cursor(532)]
+
+    @pytest.mark.asyncio
+    async def test_follows_next_page_when_count_is_stale(self):
+        c1 = scraper.encode_evaluations_cursor(532)
+        session, calls = self._make_session({
+            c1: self._page(["2016-06-01T00:00:00.000Z"], has_next=True, last_cursor="NjMy"),
+            "NjMy": self._page(["2016-04-14T00:00:00.000Z"]),
+        })
+        date, status = await scraper.fetch_first_review_date(session, "p", 632)
+        assert (date, status) == ("2016-04-14", "ok")
+        assert calls == [c1, "NjMy"]
+
+    @pytest.mark.asyncio
+    async def test_backsteps_when_count_overshoots(self):
+        # number_of_ratings says 250 but the API only has 120 -> offset 150 is empty, 50 is not
+        session, calls = self._make_session({
+            scraper.encode_evaluations_cursor(50): self._page(["2020-01-05T00:00:00.000Z", "2019-12-31T00:00:00.000Z"]),
+        })
+        date, status = await scraper.fetch_first_review_date(session, "p", 250)
+        assert (date, status) == ("2019-12-31", "ok")
+        assert calls == [scraper.encode_evaluations_cursor(150), scraper.encode_evaluations_cursor(50)]
+
+    @pytest.mark.asyncio
+    async def test_no_reviews(self):
+        session, _ = self._make_session({})
+        assert await scraper.fetch_first_review_date(session, "p", 3) == (None, "no_reviews")
+
+    @pytest.mark.asyncio
+    async def test_fetch_failed(self):
+        with patch("tpt_scraper.fetch_evaluations_page", new_callable=AsyncMock) as m:
+            m.return_value = None
+            assert await scraper.fetch_first_review_date(object(), "p", 40) == (None, "fetch_failed")
 
 
 class TestDownloadWorkflow:

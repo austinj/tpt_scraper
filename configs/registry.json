@@ -17,6 +17,18 @@
       "created": "2026-02-04T15:42:00.000000",
       "description": "SEL resources - simplified config (all grades x SEL subjects x all prices)",
       "db_file": "scrape_cache_sel_simple.db"
+    },
+    "sel_test": {
+      "file": "configs\\sel_test.json",
+      "created": "2026-10-09T13:50:15.287755",
+      "description": "20-page smoke test",
+      "db_file": "scrape_cache_sel_test.db"
+    },
+    "sel_v2": {
+      "file": "configs\\sel_v2.json",
+      "created": "2026-10-09T14:41:27.610655",
+      "description": "SEL rescrape: post_date, first_review_date, Apollo fields, search_hits; 4 valid sort orders",
+      "db_file": "scrape_cache_sel_v2.db"
     }
   }
 }

@@ -38,10 +38,11 @@ async def setup_db(db_file: str):
         await db.execute("PRAGMA cache_size=10000;")
         await db.execute("PRAGMA temp_store=MEMORY;")
         
-        # URLs discovered during search
+        # URLs discovered during search (one row per unique URL; first combination that found it)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS search_results (
                 url TEXT PRIMARY KEY,
+                product_id TEXT,
                 resource_type TEXT,
                 grade_level TEXT,
                 subject TEXT,
@@ -52,6 +53,64 @@ async def setup_db(db_file: str):
                 page INTEGER,
                 discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        async with db.execute("PRAGMA table_info(search_results)") as cursor:
+            search_columns = {row[1] for row in await cursor.fetchall()}
+        if "product_id" not in search_columns:
+            await db.execute("ALTER TABLE search_results ADD COLUMN product_id TEXT")
+            logging.info("Migration: Added column 'product_id' to search_results")
+        # Backfill product_id for rows written before the column existed
+        async with db.execute("SELECT url FROM search_results WHERE product_id IS NULL") as cursor:
+            missing = [row[0] for row in await cursor.fetchall()]
+        if missing:
+            await db.executemany(
+                "UPDATE search_results SET product_id = ? WHERE url = ?",
+                [(extract_product_id(u), u) for u in missing],
+            )
+            logging.info(f"Migration: backfilled product_id for {len(missing):,} search_results rows")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_search_product_id ON search_results(product_id);")
+
+        # Every (product, search combination, page, rank) appearance. A product that
+        # shows up under several grades/subjects/prices/sort orders gets one row per
+        # appearance here, which is what lets you measure overlap between searches.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS search_hits (
+                product_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                resource_type TEXT,
+                grade_level TEXT,
+                subject TEXT,
+                format TEXT,
+                price_option TEXT,
+                supports TEXT,
+                sort_order TEXT,
+                page INTEGER,
+                rank_on_page INTEGER,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(product_id, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_hits_product_id ON search_hits(product_id);")
+
+        # Per-product overlap summary: how many distinct search combinations surfaced it
+        await db.execute("""
+            CREATE VIEW IF NOT EXISTS product_search_summary AS
+            SELECT
+                product_id,
+                MIN(url)                                   AS url,
+                COUNT(*)                                   AS n_hits,
+                COUNT(DISTINCT grade_level)                AS n_grade_levels,
+                COUNT(DISTINCT subject)                    AS n_subjects,
+                COUNT(DISTINCT price_option)               AS n_price_options,
+                COUNT(DISTINCT sort_order)                 AS n_sort_orders,
+                MIN(page)                                  AS best_page,
+                MIN(page * 1000 + rank_on_page)            AS best_position,
+                GROUP_CONCAT(DISTINCT grade_level)         AS grade_levels,
+                GROUP_CONCAT(DISTINCT subject)             AS subjects,
+                GROUP_CONCAT(DISTINCT price_option)        AS price_options,
+                GROUP_CONCAT(DISTINCT sort_order)          AS sort_orders
+            FROM search_hits
+            GROUP BY product_id
         """)
         
         # Product metadata
@@ -85,6 +144,33 @@ async def setup_db(db_file: str):
             ("author_follower_count", "INTEGER"),
             ("product_id", "TEXT"),
             ("oldest_review_date", "TEXT"),
+            # Fields read from the page's embedded Apollo state (see extract_product_details)
+            ("post_date", "TEXT"),
+            ("item_type", "TEXT"),
+            ("file_kind", "TEXT"),
+            ("file_size_bytes", "INTEGER"),
+            ("page_count", "TEXT"),
+            ("price_full", "TEXT"),
+            ("price_discount", "TEXT"),
+            ("price_sale", "TEXT"),
+            ("price_additional_license", "TEXT"),
+            ("is_free", "INTEGER"),
+            ("taxonomy_tags", "TEXT"),
+            ("common_core_standards", "TEXT"),
+            ("answer_key", "TEXT"),
+            ("teaching_duration", "TEXT"),
+            ("bundle_count", "INTEGER"),
+            ("image_count", "INTEGER"),
+            ("has_preview_video", "INTEGER"),
+            ("has_main_video", "INTEGER"),
+            ("store_id", "TEXT"),
+            ("store_follower_count", "INTEGER"),
+            ("store_total_items", "INTEGER"),
+            ("v1_evaluations_count", "INTEGER"),
+            ("rating_distribution", "TEXT"),
+            ("evaluation_facets", "TEXT"),
+            # True first-review date from the evaluations GraphQL API (see fetch_first_review_date)
+            ("first_review_date", "TEXT"),
         ]
         
         for col_name, col_type in migrations:
@@ -197,6 +283,11 @@ def build_page_url(resource_type, grade_level, subject, format_type, price_optio
     
     return f"{base_url}?{'&'.join(query_params)}" if query_params else base_url
 
+# Product title links on browse pages. CSS-module class names carry a build hash
+# ("--YPqiC") that changes on every TPT frontend deploy, so match on the stable
+# stem rather than the full class.
+PRODUCT_CARD_LINK_SELECTOR = 'a[class*="ProductRowCard-module__cardTitleLink"]'
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -214,10 +305,13 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
     backoff = 1
     
     while retries < max_retries:
-        start_time = time.time()
         try:
             if rate_limiter:
                 await rate_limiter.wait()
+            # Time only the HTTP round-trip: including the limiter's own sleep made the
+            # measured response time always exceed the 2s speed-up threshold, so the
+            # adaptive limiter could never back off from its initial delay.
+            start_time = time.time()
                 
             async with async_timeout.timeout(30):
                 async with session.get(url, headers=BROWSER_HEADERS) as response:
@@ -231,7 +325,7 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
                         if rate_limiter:
                             rate_limiter.record_response(False, response_time)
                         wait = int(response.headers.get("Retry-After", backoff * 4))
-                        logging.warning(f"Rate limited (429) — waiting {wait}s")
+                        logging.warning(f"Rate limited (429) - waiting {wait}s")
                         await asyncio.sleep(wait)
                         raise Exception(f"Rate limited (429)")
                     elif response.status >= 500:
@@ -290,7 +384,7 @@ async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
 
     HARD_FAIL = {403, 429, 503}
     bad_keys: set = set()
-    SELECTOR = "a.ProductRowCard-module__cardTitleLink--YPqiC"
+    SELECTOR = PRODUCT_CARD_LINK_SELECTOR
 
     async with aiohttp.ClientSession() as session:
         for key, url in probe_urls.items():
@@ -308,14 +402,14 @@ async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
                             )
                             return False, set()
                         elif status == 404:
-                            logging.warning(f"Pre-flight 404 — skipping: {url}")
+                            logging.warning(f"Pre-flight 404 - skipping: {url}")
                             bad_keys.add(key)
                         elif status == 200:
                             html = await resp.text()
                             count = len(BeautifulSoup(html, "lxml").select(SELECTOR))
                             if count == 0:
                                 logging.warning(
-                                    f"Pre-flight 200 but 0 products — skipping: {url}"
+                                    f"Pre-flight 200 but 0 products - skipping: {url}"
                                 )
                                 bad_keys.add(key)
                             else:
@@ -324,7 +418,7 @@ async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
                                 )
                         else:
                             logging.warning(
-                                f"Pre-flight HTTP {status} — skipping: {url}"
+                                f"Pre-flight HTTP {status} - skipping: {url}"
                             )
                             bad_keys.add(key)
                         await asyncio.sleep(0.5)
@@ -347,6 +441,67 @@ async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
         return False, set()
 
     return True, bad_keys
+
+
+# Sort orders TPT's browse UI currently offers. Unknown values are not rejected by
+# the server - they silently fall back to Relevance, duplicating those requests.
+KNOWN_SORT_ORDERS = {"Relevance", "Rating", "Price-Asc", "Most-Recent"}
+
+
+async def check_sort_orders(config: Dict[str, Any], good_keys: List[tuple]) -> List[str]:
+    """
+    Return the config's sort orders minus any the server ignores.
+
+    Fetches page 1 of one valid base combination under each sort order and compares
+    the product sequence to the default (Relevance) ordering; an identical sequence
+    means the value is being ignored. Falls back to the configured list on error.
+    """
+    sort_orders = config.get("sorting_methods", ["Relevance"])
+    if len(sort_orders) <= 1 or not good_keys:
+        return sort_orders
+
+    unknown = [s for s in sort_orders if s not in KNOWN_SORT_ORDERS]
+    if unknown:
+        logging.warning(f"Sort orders not in the current TPT UI: {unknown} - verifying against the server")
+
+    rt, gl, sub, fmt, price, sup = good_keys[0]
+
+    def product_ids(html: str) -> List[str]:
+        soup = BeautifulSoup(html, "lxml")
+        return [extract_product_id(a.get("href", "")) or a.get("href", "")
+                for a in soup.select(PRODUCT_CARD_LINK_SELECTOR)]
+
+    sequences: Dict[str, List[str]] = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            for sort in dict.fromkeys(["Relevance"] + list(sort_orders)):
+                url = build_page_url(rt, gl, sub, fmt, price, sup, sort, 1)
+                async with async_timeout.timeout(15):
+                    async with session.get(url, headers=BROWSER_HEADERS, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            logging.warning(f"Sort check: HTTP {resp.status} for {url}; skipping sort validation")
+                            return sort_orders
+                        sequences[sort] = product_ids(await resp.text())
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        logging.warning(f"Sort check failed ({e}); using configured sort orders as-is")
+        return sort_orders
+
+    baseline = sequences.get("Relevance") or []
+    kept, dropped = [], []
+    for sort in sort_orders:
+        if sort != "Relevance" and baseline and sequences.get(sort) == baseline:
+            dropped.append(sort)
+        else:
+            kept.append(sort)
+    if dropped:
+        logging.warning(
+            f"Sort check: {dropped} return the same results as Relevance (server ignores them) - "
+            f"dropping to avoid duplicate requests. Valid sorts: {sorted(KNOWN_SORT_ORDERS)}"
+        )
+    else:
+        logging.info(f"Sort check: all {len(sort_orders)} sort orders produce distinct orderings")
+    return kept
 
 
 ###########################
@@ -394,12 +549,18 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
     if not ok:
         logging.error("Search aborted due to pre-flight failure.")
         return
-    if bad_keys:
-        before = len(combinations)
-        combinations = [
-            c for c in combinations
-            if (c[0], c[1], c[2], c[3], c[4], c[5]) not in bad_keys
-        ]
+
+    # Drop sort orders the server ignores (they would just re-fetch the Relevance pages)
+    good_keys = [k for k in dict.fromkeys((c[0], c[1], c[2], c[3], c[4], c[5]) for c in combinations)
+                 if k not in bad_keys]
+    sorting_methods = await check_sort_orders(config, good_keys)
+
+    before = len(combinations)
+    combinations = [
+        c for c in combinations
+        if (c[0], c[1], c[2], c[3], c[4], c[5]) not in bad_keys and c[6] in sorting_methods
+    ]
+    if before != len(combinations):
         logging.info(
             f"Pre-flight filtered {before - len(combinations):,} combinations "
             f"({len(combinations):,} remaining)"
@@ -459,27 +620,34 @@ async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
                 return []
             
             soup = BeautifulSoup(html, "lxml")
-            product_elements = soup.select("a.ProductRowCard-module__cardTitleLink--YPqiC")
+            product_elements = soup.select(PRODUCT_CARD_LINK_SELECTOR)
             
             urls_found = []
-            for product in product_elements:
+            for rank, product in enumerate(product_elements, start=1):
                 href = product.get("href")
                 if href:
                     full_url = f"https://www.teacherspayteachers.com{href}" if not href.startswith("http") else href
                     urls_found.append((
-                        full_url, resource_type, grade_level, subject, format_type, 
-                        price_option, supports_val, sort_order, page
+                        full_url, extract_product_id(full_url), resource_type, grade_level, subject, format_type,
+                        price_option, supports_val, sort_order, page, rank
                     ))
             
             # Store results
             async with aiosqlite.connect(db_file) as db:
-                # Store URLs
-                for url_data in urls_found:
+                for (full_url, product_id, *combo_fields, rank) in urls_found:
+                    # First-seen record (unique per URL) - downstream stages read this table
                     await db.execute("""
                         INSERT OR IGNORE INTO search_results 
-                        (url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, url_data)
+                        (url, product_id, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (full_url, product_id, *combo_fields))
+                    # Every appearance, for overlap analysis
+                    if product_id:
+                        await db.execute("""
+                            INSERT OR IGNORE INTO search_hits
+                            (product_id, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, rank_on_page)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (product_id, full_url, *combo_fields, rank))
                 
                 # Mark combination as searched
                 await db.execute("""
@@ -536,10 +704,123 @@ def extract_text_with_spacing(element):
     text = re.sub(r'\s+', ' ', text).strip()
     return text if text else None
 
+
+def extract_product_id(url: str) -> Optional[str]:
+    """Extract the numeric product ID from a TPT product URL, e.g.
+    '.../Product/Some-Title-1234567' or '.../Product/--1234567' -> '1234567'."""
+    match = re.search(r'/Product/[^/?#]*?-(\d+)/?(?:[?#].*)?$', url)
+    return match.group(1) if match else None
+
+
+# Columns written by scrape_metadata(), in INSERT order. Every dict returned by
+# scrape_product_metadata() has exactly these keys.
+METADATA_COLUMNS = [
+    "url", "product_id", "title", "short_description", "long_description",
+    "rating_value", "number_of_ratings", "product_price", "preview_keywords",
+    "author_name", "author_store_url", "author_follower_count",
+    # Apollo-state fields
+    "post_date", "item_type", "file_kind", "file_size_bytes", "page_count",
+    "price_full", "price_discount", "price_sale", "price_additional_license", "is_free",
+    "taxonomy_tags", "common_core_standards", "answer_key", "teaching_duration",
+    "bundle_count", "image_count", "has_preview_video", "has_main_video",
+    "store_id", "store_follower_count", "store_total_items",
+    "v1_evaluations_count", "rating_distribution", "evaluation_facets",
+]
+PRODUCT_DETAIL_COLUMNS = METADATA_COLUMNS[METADATA_COLUMNS.index("post_date"):]
+
+
+def extract_apollo_state(html: str) -> Optional[dict]:
+    """Return the Apollo client cache that TPT embeds in every server-rendered
+    product page ("apolloState": {...}). It holds the normalized GraphQL objects
+    (Product, Store, Evaluation facets, ...) the page was rendered from."""
+    marker = '"apolloState":'
+    start = html.find(marker)
+    if start < 0:
+        return None
+    try:
+        state, _ = json.JSONDecoder().raw_decode(html, start + len(marker))
+    except ValueError:
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _facet_counts(facet_list) -> dict:
+    return {f.get("value"): f.get("count") for f in facet_list or [] if isinstance(f, dict)}
+
+
+def extract_product_details(state: Optional[dict], product_id: Optional[str]) -> dict:
+    """Pull product/store/review-facet fields out of the Apollo state.
+    Always returns a dict with every PRODUCT_DETAIL_COLUMNS key (None if unavailable)."""
+    details = {col: None for col in PRODUCT_DETAIL_COLUMNS}
+    if not state:
+        return details
+
+    product = state.get(f"Product:{product_id}") if product_id else None
+    if not isinstance(product, dict):
+        # Bundles reference sibling Product:* entries; pick the one the page is about
+        product = next((v for k, v in state.items()
+                        if k.startswith("Product:") and isinstance(v, dict) and "postDate" in v), None)
+    if not isinstance(product, dict):
+        return details
+
+    details["post_date"] = product.get("postDate")
+    details["item_type"] = product.get("itemType")
+    details["file_kind"] = product.get("kind")
+
+    file_preview = product.get("filePreview") or {}
+    details["file_size_bytes"] = file_preview.get("filesize")
+    details["page_count"] = file_preview.get("pageCount")
+
+    prices = product.get("prices") or {}
+    license_prices = prices.get("nonTransferableLicense") or {}
+    details["price_full"] = license_prices.get("price") or product.get("price")
+    details["price_discount"] = license_prices.get("discountPrice") or product.get("discountprice")
+    details["price_sale"] = license_prices.get("salePrice") or product.get("saleprice")
+    details["price_additional_license"] = license_prices.get("additionalLicensePrice") or product.get("licenseprice")
+    is_free = prices.get("isFree", product.get("isFree"))
+    details["is_free"] = None if is_free is None else int(bool(is_free))
+
+    tags = [ref["__ref"].split(":", 1)[1] for ref in product.get("taxonomyTags") or []
+            if isinstance(ref, dict) and isinstance(ref.get("__ref"), str) and ":" in ref["__ref"]]
+    details["taxonomy_tags"] = ", ".join(tags) if tags else None
+
+    standards = product.get("commonCoreStandards") or []
+    details["common_core_standards"] = json.dumps(standards) if standards else None
+    details["answer_key"] = product.get("answerKey")
+    details["teaching_duration"] = product.get("teachingDuration")
+    details["bundle_count"] = len(product.get("includedIn") or [])
+    details["image_count"] = len(product.get("images") or [])
+    details["has_preview_video"] = int(bool(product.get("previewVideo")))
+    details["has_main_video"] = int(bool(product.get("mainVideo")))
+    details["v1_evaluations_count"] = (product.get("evaluationRating") or {}).get("v1EvaluationsCount")
+
+    store_ref = (product.get("author") or {}).get("__ref")
+    store = state.get(store_ref) if store_ref else None
+    if isinstance(store, dict):
+        details["store_id"] = store.get("id")
+        details["store_follower_count"] = store.get("followerCount")
+        details["store_total_items"] = store.get("totalItems")
+
+    # Review facets (star distribution, grades used with, SPED use, yes/no signals)
+    # live on the cached filterEvaluationsByResource query under ROOT_QUERY.
+    root = state.get("ROOT_QUERY") or {}
+    for key, value in root.items():
+        if key.startswith("filterEvaluationsByResource(") and isinstance(value, dict):
+            facets = value.get("facets") or {}
+            star = _facet_counts(facets.get("starRatingGroup"))
+            details["rating_distribution"] = json.dumps(star) if star else None
+            all_facets = {name: _facet_counts(lst) for name, lst in facets.items() if isinstance(lst, list)}
+            details["evaluation_facets"] = json.dumps(all_facets) if all_facets else None
+            break
+
+    return details
+
+
 async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None):
-    """Scrape metadata from a single product URL."""
+    """Scrape metadata from a single product URL. Returns a dict keyed by METADATA_COLUMNS."""
     html = await fetch(session, url, rate_limiter)
     if not html:
+        logging.warning(f"[{extract_product_id(url) or '?'}] FAILED fetch: {url}")
         return None
     
     soup = BeautifulSoup(html, "lxml")
@@ -575,17 +856,21 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
     grade_level = None
     grade_elem = soup.find(attrs={"data-testid": "GradesLabel"})
     if grade_elem:
-        grade_text = grade_elem.get_text(strip=True)
-        grade_level = re.sub(r'^Mostly used with\s*', '', grade_text).strip() or None
+        # The label is several adjacent nodes ("K-8th", "Mostly used with", "6th") that
+        # get_text(strip=True) fuses into "K-8th Mostly used with6th". Split them into
+        # two comma-separated keywords so the tokenizer sees the range and the
+        # "mostly used with" grades separately.
+        grade_text = grade_elem.get_text(" ", strip=True)
+        grade_text = re.sub(r'\s*Mostly used with\s*', ', mostly used with ', grade_text, flags=re.IGNORECASE)
+        grade_text = re.sub(r'\s+', ' ', grade_text).strip(' ,')
+        grade_level = grade_text or None
     
     categories = []
     category_elems = soup.select('[data-testid^="Link_"]')
     if category_elems:
         categories = [cat.get_text(strip=True) for cat in category_elems]
     
-    preview_keywords = ""
-    if grade_level or categories:
-        preview_keywords = (grade_level or "") + (" " if grade_level and categories else "") + ", ".join(categories)
+    preview_keywords = ", ".join([k for k in [grade_level] if k] + categories)
     
     # Extract author/seller info
     author_name = None
@@ -625,24 +910,33 @@ async def scrape_product_metadata(session, url, rate_limiter: Optional[AdaptiveR
             except ValueError:
                 author_follower_count = 0
         else:
-            # Container exists but no count found — seller has 0 followers
+            # Container exists but no count found - seller has 0 followers
             author_follower_count = 0
     
     # Extract product ID from URL
-    product_id = None
-    id_match = re.search(r'/Product/[^/]+-(\d+)(?:\?|$)', url)
-    if id_match:
-        product_id = id_match.group(1)
-    
-    # Return tuple in order matching INSERT: url, product_id, title, short_description, long_description, 
-    # rating_value, number_of_ratings, product_price, preview_keywords, author_name, author_store_url, author_follower_count
-    return (url, product_id, title, short_description, long_description, rating_value, number_of_ratings, 
-            product_price, preview_keywords, author_name, author_store_url, author_follower_count)
+    product_id = extract_product_id(url)
+
+    record = {
+        "url": url, "product_id": product_id, "title": title,
+        "short_description": short_description, "long_description": long_description,
+        "rating_value": rating_value, "number_of_ratings": number_of_ratings,
+        "product_price": product_price, "preview_keywords": preview_keywords,
+        "author_name": author_name, "author_store_url": author_store_url,
+        "author_follower_count": author_follower_count,
+    }
+    record.update(extract_product_details(extract_apollo_state(html), product_id))
+    logging.info(
+        f"[{product_id or '?'}] ratings={number_of_ratings or 0} "
+        f"posted={(record['post_date'] or 'MISSING')[:10]} "
+        f"followers={record['store_follower_count'] if record['store_follower_count'] is not None else '?'} "
+        f"price={record['price_full'] or product_price or '?'} | {re.sub(r'\s+', ' ', title or '').strip()[:60]}"
+    )
+    return record
 
 async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: int = 8,
                           rescrape: bool = False, no_cache: bool = False,
                           batch_size: int = 100, sleep_min: float = 1.0, sleep_max: float = 3.0,
-                          max_rate_limit_delay: float = 30.0):
+                          max_rate_limit_delay: float = 30.0, backfill: bool = False):
     """
     Scrape metadata for all URLs found in search.
     
@@ -652,11 +946,16 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
         concurrent_requests: Number of concurrent requests
         rescrape: If True, re-scrape ALL products (not just new ones)
         no_cache: If True, bypass HTTP cache for fresh fetches
+        backfill: If True, re-scrape only existing products that are missing
+                  post_date (i.e. scraped before the Apollo-state fields were added).
+                  Resumable: each batch is committed as it completes.
     """
     logging.info(f"=" * 60)
     logging.info(f"SCRAPE METADATA WORKFLOW - Configuration: {config_name}")
     if rescrape:
         logging.info(f"MODE: Rescraping ALL products")
+    if backfill:
+        logging.info(f"MODE: Backfilling products missing post_date")
     if no_cache:
         logging.info(f"MODE: Cache disabled (fresh fetches)")
     logging.info(f"=" * 60)
@@ -666,6 +965,9 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
         if rescrape:
             # Rescrape all URLs from search results
             async with db.execute("SELECT DISTINCT url FROM search_results") as cursor:
+                urls_to_scrape = [row[0] for row in await cursor.fetchall()]
+        elif backfill:
+            async with db.execute("SELECT url FROM product_metadata WHERE post_date IS NULL") as cursor:
                 urls_to_scrape = [row[0] for row in await cursor.fetchall()]
         else:
             # Only scrape URLs that don't have metadata yet
@@ -715,6 +1017,22 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
         failed_count = 0
         start_time = time.time()
         total_items = len(urls_to_scrape)
+
+        # Column-driven SQL so new Apollo fields only need adding to METADATA_COLUMNS.
+        # Backfill keeps the original preview_keywords: the grade label it came from is
+        # client-rendered and not reliably present in a plain fetch, and taxonomy_tags
+        # now carries the same information in a cleaner form.
+        cols = ", ".join(METADATA_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in METADATA_COLUMNS)
+        preserved = {"url"} | ({"preview_keywords"} if backfill and not rescrape else set())
+        update_set = ", ".join(f"{c} = excluded.{c}" for c in METADATA_COLUMNS if c not in preserved)
+        upsert_sql = f"""
+            INSERT INTO product_metadata ({cols}, scraped_at)
+            VALUES ({placeholders}, CURRENT_TIMESTAMP)
+            ON CONFLICT(url) DO UPDATE SET {update_set}, scraped_at = CURRENT_TIMESTAMP
+        """
+        insert_sql = f"INSERT OR IGNORE INTO product_metadata ({cols}) VALUES ({placeholders})"
+        write_sql = upsert_sql if (rescrape or backfill) else insert_sql
         
         for i in range(0, len(urls_to_scrape), batch_size):
             batch = urls_to_scrape[i:i+batch_size]
@@ -727,36 +1045,7 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
             async with aiosqlite.connect(db_file) as db:
                 for result in results:
                     if result and not isinstance(result, Exception):
-                        if rescrape:
-                            # Upsert: update if exists, insert if not
-                            await db.execute("""
-                                INSERT INTO product_metadata
-                                (url, product_id, title, short_description, long_description, rating_value, 
-                                 number_of_ratings, product_price, preview_keywords, author_name,
-                                 author_store_url, author_follower_count, scraped_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                ON CONFLICT(url) DO UPDATE SET
-                                    product_id = excluded.product_id,
-                                    title = excluded.title,
-                                    short_description = excluded.short_description,
-                                    long_description = excluded.long_description,
-                                    rating_value = excluded.rating_value,
-                                    number_of_ratings = excluded.number_of_ratings,
-                                    product_price = excluded.product_price,
-                                    preview_keywords = excluded.preview_keywords,
-                                    author_name = excluded.author_name,
-                                    author_store_url = excluded.author_store_url,
-                                    author_follower_count = excluded.author_follower_count,
-                                    scraped_at = CURRENT_TIMESTAMP
-                            """, result)
-                        else:
-                            await db.execute("""
-                                INSERT OR IGNORE INTO product_metadata
-                                (url, product_id, title, short_description, long_description, rating_value, 
-                                 number_of_ratings, product_price, preview_keywords, author_name,
-                                 author_store_url, author_follower_count)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, result)
+                        await db.execute(write_sql, result)
                         scraped_count += 1
                     else:
                         failed_count += 1
@@ -786,227 +1075,257 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
     logging.info(f"=" * 60)
 
 ###########################
-# 2b. DEEP SCRAPE (Playwright)
+# 2b. DEEP SCRAPE (first review date via GraphQL)
 ###########################
 
-async def deep_scrape_oldest_review(url: str, browser, session_file: str = "tpt_storage.json") -> Tuple[Optional[str], bool]:
-    """
-    Use Playwright to load a product page, click through all reviews,
-    and extract the oldest review date.
-    
-    Args:
-        url: Product URL to scrape
-        browser: Playwright browser instance (reused across calls)
-        session_file: Path to Playwright storage state
-    
-    Returns the oldest review date as a string (e.g., "October 28, 2008") or None.
-    """
-    from datetime import datetime
-    
-    product_id = extract_product_id(url)
-    oldest_date = None
-    oldest_datetime = None
-    
-    try:
-        context = await browser.new_context(storage_state=session_file)
-        page = await context.new_page()
-        
-        logging.info(f"[{product_id}] Deep scraping: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # Give JS a moment to render review content
-        await page.wait_for_timeout(2000)
-        
-        # Click "Show more reviews" until it's gone or we hit a limit
-        max_clicks = 50  # Safety limit
-        clicks = 0
-        
-        while clicks < max_clicks:
-            try:
-                # Look for the "Show more reviews" button
-                show_more = page.locator("text=Show more reviews").first
-                if await show_more.is_visible(timeout=2000):
-                    await show_more.click()
-                    await page.wait_for_timeout(500)  # Wait for content to load
-                    clicks += 1
-                else:
-                    break
-            except:
-                break
-        
-        if clicks > 0:
-            logging.info(f"[{product_id}] Clicked 'Show more reviews' {clicks} times")
-        
-        # Now extract all review dates from the page
-        # Review dates appear as text like "February 3, 2026", "October 28, 2008", etc.
-        content = await page.content()
-        
-        # Close context to free resources
-        await context.close()
-        
-        # Check if the product actually has reviews via JSON-LD reviewCount/ratingCount
-        review_count_match = re.search(r'"reviewCount"\s*:\s*(\d+)', content)
-        rating_count_match = re.search(r'"ratingCount"\s*:\s*(\d+)', content)
-        review_count = int(review_count_match.group(1)) if review_count_match else 0
-        rating_count = int(rating_count_match.group(1)) if rating_count_match else 0
-        has_reviews = review_count > 0 or rating_count > 0
-        
-        if not has_reviews:
-            logging.info(f"[{product_id}] No reviews (count=0), skipping date extraction")
-            return None, False
-        
-        # 1. Parse ISO dates from JSON-LD "datePublished" fields (most reliable)
-        iso_matches = re.findall(r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})', content)
-        for date_str in iso_matches:
-            try:
-                parsed = datetime.strptime(date_str, "%Y-%m-%d")
-                if oldest_datetime is None or parsed < oldest_datetime:
-                    oldest_datetime = parsed
-                    oldest_date = date_str
-            except ValueError:
-                continue
-        
-        # No text-based fallback — regex on full page HTML matches dates from
-        # product descriptions (movie release dates, historical events), Q&A,
-        # teacher bios, etc. JSON-LD datePublished is scoped to reviews and
-        # is the only reliable source.
-        
-        if oldest_date:
-            logging.info(f"[{product_id}] Oldest review date: {oldest_date} (reviews: {review_count})")
-        else:
-            logging.warning(f"[{product_id}] Has {review_count} reviews but no dates extracted")
-        
-        return oldest_date, has_reviews
-            
-    except Exception as e:
-        logging.error(f"[{product_id}] Deep scrape failed: {e}")
-        return None, False
+# The product page's reviews widget pages through the evaluations API with
+# base64-encoded integer offsets as cursors ("OA==" -> 8). The server caps a
+# page at 100 and reports totalCount as at most 10,000, but offsets past 10,000
+# still return rows, so jumping to `number_of_ratings - 100` sorted by mostRecent
+# lands on the oldest reviews in a single request.
+GATEWAY_GRAPHQL_URL = "https://www.teacherspayteachers.com/gateway/graphql"
+EVALUATIONS_PAGE_SIZE = 100
+EVALUATIONS_MAX_BACKSTEPS = 5    # when number_of_ratings overshoots the real count
+EVALUATIONS_MAX_FOLLOW_PAGES = 20  # when new reviews arrived since the metadata scrape
+EVALUATIONS_QUERY = """
+query FirstReview($resourceId: ID!, $first: Int, $after: String) {
+  filterEvaluationsByResource(
+    resourceId: $resourceId
+    filters: {}
+    sortBy: "mostRecent"
+    pagination: { first: $first, after: $after }
+  ) {
+    totalCount
+    pageInfo { hasNextPage lastCursor }
+    edges { cursor node { createdAt } }
+  }
+}
+"""
+GRAPHQL_HEADERS = {
+    "User-Agent": BROWSER_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+    "Content-Type": "application/json",
+    "Origin": "https://www.teacherspayteachers.com",
+    "Referer": "https://www.teacherspayteachers.com/",
+}
 
 
-async def deep_scrape_products(config_name: str, db_file: str, session_file: str = "tpt_storage.json",
-                               limit: Optional[int] = None, concurrent: int = 3):
+def encode_evaluations_cursor(offset: int) -> Optional[str]:
+    """Cursor for 'rows after offset'. None means start from the beginning."""
+    if offset <= 0:
+        return None
+    import base64
+    return base64.b64encode(str(offset).encode()).decode()
+
+
+async def fetch_evaluations_page(session, product_id: str, after: Optional[str],
+                                 rate_limiter: Optional[AdaptiveRateLimiter] = None,
+                                 max_retries: int = 3) -> Optional[dict]:
+    """POST one page of the evaluations query. Returns the connection dict
+    (totalCount / pageInfo / edges) or None after exhausting retries."""
+    payload = {
+        "query": EVALUATIONS_QUERY,
+        "variables": {"resourceId": str(product_id), "first": EVALUATIONS_PAGE_SIZE, "after": after},
+    }
+    backoff = 1
+    for attempt in range(1, max_retries + 1):
+        try:
+            if rate_limiter:
+                await rate_limiter.wait()
+            start_time = time.time()  # time the round-trip only (see fetch)
+            async with async_timeout.timeout(30):
+                async with session.post(GATEWAY_GRAPHQL_URL, json=payload, headers=GRAPHQL_HEADERS) as response:
+                    response_time = time.time() - start_time
+                    if response.status == 429:
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        wait = int(response.headers.get("Retry-After", backoff * 4))
+                        logging.warning(f"[{product_id}] GraphQL rate limited (429) - waiting {wait}s")
+                        await asyncio.sleep(wait)
+                        raise Exception("Rate limited (429)")
+                    if response.status != 200:
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        raise Exception(f"HTTP {response.status}")
+                    body = await response.json(content_type=None)
+            if rate_limiter:
+                rate_limiter.record_response(True, response_time)
+            if body.get("errors"):
+                # Schema-level rejection (bad id, bad argument) - retrying won't help
+                logging.warning(f"[{product_id}] GraphQL errors: {json.dumps(body['errors'])[:300]}")
+                return None
+            connection = (body.get("data") or {}).get("filterEvaluationsByResource")
+            return connection if isinstance(connection, dict) else None
+        except Exception as e:
+            logging.debug(f"[{product_id}] GraphQL attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+    logging.error(f"[{product_id}] GraphQL request failed after {max_retries} retries")
+    return None
+
+
+async def fetch_first_review_date(session, product_id: str, review_count: int,
+                                  rate_limiter: Optional[AdaptiveRateLimiter] = None) -> Tuple[Optional[str], str]:
     """
-    Deep scrape products to find oldest review dates using Playwright.
-    Only processes products that don't already have an oldest_review_date.
-    Uses a single browser instance for efficiency.
+    Find the date of a product's earliest review.
+
+    Returns (date, status):
+      ("YYYY-MM-DD", "ok")        earliest review found
+      (None, "no_reviews")        API returned no evaluations at all
+      (None, "fetch_failed")      network / API failure; safe to retry later
+    """
+    offset = max(int(review_count or 0) - EVALUATIONS_PAGE_SIZE, 0)
+
+    # Jump to the tail. If number_of_ratings overshoots the API's count the jump
+    # lands past the end and returns no rows, so back up a page at a time.
+    page = None
+    for _ in range(EVALUATIONS_MAX_BACKSTEPS + 1):
+        page = await fetch_evaluations_page(session, product_id, encode_evaluations_cursor(offset), rate_limiter)
+        if page is None:
+            return None, "fetch_failed"
+        if page.get("edges"):
+            break
+        if offset == 0:
+            return None, "no_reviews"
+        offset = max(offset - EVALUATIONS_PAGE_SIZE, 0)
+    else:
+        return None, "fetch_failed"
+
+    dates = [e["node"]["createdAt"] for e in page["edges"]
+             if isinstance(e.get("node"), dict) and e["node"].get("createdAt")]
+
+    # If reviews were added after the metadata scrape the tail extends further;
+    # keep following lastCursor until the API says there is no next page.
+    pages = 1
+    while page.get("pageInfo", {}).get("hasNextPage") and pages < EVALUATIONS_MAX_FOLLOW_PAGES:
+        cursor = page["pageInfo"].get("lastCursor")
+        if not cursor:
+            break
+        page = await fetch_evaluations_page(session, product_id, cursor, rate_limiter)
+        if page is None:
+            return None, "fetch_failed"
+        if not page.get("edges"):
+            break
+        dates += [e["node"]["createdAt"] for e in page["edges"]
+                  if isinstance(e.get("node"), dict) and e["node"].get("createdAt")]
+        pages += 1
+
+    if not dates:
+        return None, "no_reviews"
+    return min(dates)[:10], "ok"
+
+
+async def deep_scrape_products(config_name: str, db_file: str, limit: Optional[int] = None,
+                               concurrent: int = 4, force: bool = False):
+    """
+    Fill product_metadata.first_review_date for every product with ratings by
+    querying the evaluations GraphQL API directly (no browser needed).
+
+    Skips rows that already have a first_review_date (a real date or the
+    'no_reviews' sentinel) unless force=True. Rows that failed are left NULL so
+    the next run retries them.
     """
     logging.info(f"=" * 60)
-    logging.info(f"DEEP SCRAPE WORKFLOW - Configuration: {config_name}")
+    logging.info(f"DEEP SCRAPE WORKFLOW (first review date) - Configuration: {config_name}")
+    if force:
+        logging.info("MODE: Recomputing ALL products")
     logging.info(f"=" * 60)
-    
-    # Bulk-mark products with 0 ratings as 'no_reviews' so we never visit them
+
     async with aiosqlite.connect(db_file) as db:
+        if force:
+            await db.execute("UPDATE product_metadata SET first_review_date = NULL")
+        # Products with 0 ratings never get a review date; mark them without a request
         cursor = await db.execute("""
             UPDATE product_metadata
-            SET oldest_review_date = 'no_reviews'
-            WHERE oldest_review_date IS NULL
+            SET first_review_date = 'no_reviews'
+            WHERE first_review_date IS NULL
               AND (number_of_ratings IS NULL OR CAST(number_of_ratings AS INTEGER) = 0)
         """)
         bulk_skipped = cursor.rowcount
         await db.commit()
+        query = """
+            SELECT url, number_of_ratings FROM product_metadata
+            WHERE first_review_date IS NULL
+              AND CAST(number_of_ratings AS INTEGER) > 0
+            ORDER BY CAST(number_of_ratings AS INTEGER) DESC
+        """
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
     if bulk_skipped:
         logging.info(f"Bulk-marked {bulk_skipped:,} products with 0 ratings as 'no_reviews'")
 
-    # Get URLs that need deep scraping (have ratings but no oldest_review_date yet)
-    async with aiosqlite.connect(db_file) as db:
-        query = """
-            SELECT url FROM product_metadata 
-            WHERE oldest_review_date IS NULL
-              AND CAST(number_of_ratings AS INTEGER) > 0
-            ORDER BY CAST(product_id AS INTEGER) ASC
-        """
-        if limit:
-            query += f" LIMIT {limit}"
-        
-        async with db.execute(query) as cursor:
-            urls_to_scrape = [row[0] for row in await cursor.fetchall()]
-    
-    if not urls_to_scrape:
-        logging.info("All products already have oldest_review_date!")
+    if not rows:
+        logging.info("All rated products already have first_review_date!")
         return
-    
-    logging.info(f"Products to deep scrape: {len(urls_to_scrape):,} (only those with ratings)")
-    
-    # Launch browser once and reuse for all URLs
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        logging.info("Browser launched (will be reused for all URLs)")
-        
-        # Process with limited concurrency
-        semaphore = asyncio.Semaphore(concurrent)
-        scraped_count = 0
-        no_reviews_count = 0
-        missing_dates_count = 0
-        error_count = 0
-        start_time = time.time()
-        total_items = len(urls_to_scrape)
-        
-        async def scrape_with_sem(url):
+
+    logging.info(f"Products to query: {len(rows):,} (only those with ratings)")
+
+    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=30.0)
+    semaphore = asyncio.Semaphore(concurrent)
+    connector = aiohttp.TCPConnector(limit=concurrent + 5, limit_per_host=concurrent, keepalive_timeout=30)
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+
+    found_count = no_reviews_count = failed_count = 0
+    start_time = time.time()
+    total_items = len(rows)
+    batch_size = 50
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+
+        async def lookup(url, number_of_ratings):
             async with semaphore:
-                oldest_date, has_reviews = await deep_scrape_oldest_review(url, browser, session_file)
-                return url, oldest_date, has_reviews
-        
-        # Process in batches to update DB periodically
-        batch_size = 10
-        
-        for i in range(0, len(urls_to_scrape), batch_size):
-            batch = urls_to_scrape[i:i+batch_size]
-            tasks = [scrape_with_sem(url) for url in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Store results
+                product_id = extract_product_id(url)
+                if not product_id:
+                    logging.warning(f"Could not parse product id from {url}")
+                    return url, None, "fetch_failed"
+                try:
+                    count = int(str(number_of_ratings).replace(",", ""))
+                except (TypeError, ValueError):
+                    count = 0
+                date, status = await fetch_first_review_date(session, product_id, count, rate_limiter)
+                logging.info(f"[{product_id}] ratings={count} first_review={date or status}")
+                return url, date, status
+
+        for i in range(0, total_items, batch_size):
+            batch = rows[i:i + batch_size]
+            results = await asyncio.gather(*(lookup(url, n) for url, n in batch), return_exceptions=True)
+
             async with aiosqlite.connect(db_file) as db:
                 for result in results:
                     if isinstance(result, Exception):
                         logging.error(f"Batch error: {result}")
-                        error_count += 1
+                        failed_count += 1
                         continue
-                    url, oldest_date, has_reviews = result
-                    if oldest_date:
-                        await db.execute("""
-                            UPDATE product_metadata 
-                            SET oldest_review_date = ?
-                            WHERE url = ?
-                        """, (oldest_date, url))
-                        scraped_count += 1
-                    elif has_reviews:
-                        await db.execute("""
-                            UPDATE product_metadata 
-                            SET oldest_review_date = 'parse_failed'
-                            WHERE url = ?
-                        """, (url,))
-                        missing_dates_count += 1
-                    else:
-                        await db.execute("""
-                            UPDATE product_metadata 
-                            SET oldest_review_date = 'no_reviews'
-                            WHERE url = ?
-                        """, (url,))
+                    url, date, status = result
+                    if status == "ok":
+                        await db.execute("UPDATE product_metadata SET first_review_date = ? WHERE url = ?", (date, url))
+                        found_count += 1
+                    elif status == "no_reviews":
+                        await db.execute("UPDATE product_metadata SET first_review_date = 'no_reviews' WHERE url = ?", (url,))
                         no_reviews_count += 1
+                    else:
+                        failed_count += 1  # left NULL so a later run retries it
                 await db.commit()
-            
-            # Progress with time tracking
+
             processed = min(i + batch_size, total_items)
             elapsed = time.time() - start_time
             rate = processed / elapsed if elapsed > 0 else 0
-            remaining = total_items - processed
-            eta_seconds = remaining / rate if rate > 0 else 0
-            
-            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
-            eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
-            
-            logging.info(f"Progress: {processed:,}/{total_items:,} ({processed*100//total_items}%) | Found: {scraped_count:,} | No reviews: {no_reviews_count:,} | Missing dates: {missing_dates_count:,} | Errors: {error_count:,} | Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.1f}/s")
-            
-            # Small delay between batches
-            if i + batch_size < len(urls_to_scrape):
-                await asyncio.sleep(1)
-        
-        await browser.close()
-        logging.info("Browser closed")
-    
+            eta_seconds = (total_items - processed) / rate if rate > 0 else 0
+            logging.info(
+                f"Progress: {processed:,}/{total_items:,} ({processed*100//total_items}%) | "
+                f"Found: {found_count:,} | No reviews: {no_reviews_count:,} | Failed: {failed_count:,} | "
+                f"Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s | ETA: {int(eta_seconds // 60)}m {int(eta_seconds % 60)}s | "
+                f"Rate: {rate:.1f}/s"
+            )
+
     total_elapsed = time.time() - start_time
     logging.info(f"=" * 60)
     logging.info(f"DEEP SCRAPE COMPLETE")
-    logging.info(f"Found oldest review dates for {scraped_count:,} products")
+    logging.info(f"Found first review dates for {found_count:,} products ({failed_count:,} failed, will retry next run)")
     logging.info(f"Total time: {int(total_elapsed // 60)}m {int(total_elapsed % 60)}s")
     logging.info(f"=" * 60)
 
@@ -1014,15 +1333,9 @@ async def deep_scrape_products(config_name: str, db_file: str, session_file: str
 # 3. DOWNLOAD FREE FILES  #
 ###########################
 
-def extract_product_id(url: str) -> str:
-    """Extract product ID from TPT URL. e.g., 'Product-Name-1234567' -> '1234567'"""
-    import re
-    # URL format: .../Product/Product-Name-1234567
-    match = re.search(r'/Product/[^/]+-(\d+)(?:\?|$)', url)
-    if match:
-        return match.group(1)
-    # Fallback to URL hash
-    return str(abs(hash(url)) % (10 ** 8))
+def product_id_or_hash(url: str) -> str:
+    """Product ID for use in file names; falls back to a URL hash when the URL has no ID."""
+    return extract_product_id(url) or str(abs(hash(url)) % (10 ** 8))
 
 class SessionExpiredError(Exception):
     """Raised when the TPT session cookie has expired. Aborts the entire download run."""
@@ -1039,7 +1352,7 @@ async def download_free_file(product_url: str, browser, session_file: str,
     Raises SessionExpiredError if the auth cookie needs to be refreshed.
     """
     free_url = product_url.replace("/Product/", "/FreeDownload/")
-    product_id = extract_product_id(product_url)
+    product_id = product_id_or_hash(product_url)
     product_dir = downloads_dir / product_id
     product_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1060,7 +1373,7 @@ async def download_free_file(product_url: str, browser, session_file: str,
             download = await dl_info.value
 
         except Exception:
-            # Download did not auto-start — inspect the landing page
+            # Download did not auto-start - inspect the landing page
             current_url = page.url
 
             # Detect session expiry (redirect to login / request-authorization)
@@ -1208,7 +1521,7 @@ async def download_free_products(config_name: str, db_file: str,
     urls_to_download = []
     already_downloaded = 0
     for url, price in all_urls:
-        product_id = extract_product_id(url)
+        product_id = product_id_or_hash(url)
         product_folder = downloads_dir / product_id
         if product_folder.exists() and any(product_folder.iterdir()):
             already_downloaded += 1
@@ -1269,7 +1582,7 @@ async def download_free_products(config_name: str, db_file: str,
             if session_expired:
                 remaining_count = total - i
                 logging.error(
-                    f"Session expired — stopping ({remaining_count} products not downloaded). "
+                    f"Session expired - stopping ({remaining_count} products not downloaded). "
                     "Run create_session.py then re-run download to resume."
                 )
                 break
@@ -1361,11 +1674,11 @@ async def cmd_config_create(args):
     
     success = manager.create_config(args.name, config_data, args.description or "")
     if success:
-        print(f"✅ Created configuration: {args.name}")
+        print(f"[OK] Created configuration: {args.name}")
         print(f"   Database: {manager.get_db_file(args.name)}")
         print(f"   Edit: configs/{args.name}.json")
     else:
-        print(f"❌ Failed to create configuration")
+        print("[FAIL] Failed to create configuration")
 
 async def cmd_config_list(args):
     """List all configurations."""
@@ -1422,10 +1735,11 @@ async def cmd_scrape(args):
         sleep_min=config.get("sleep_between_batches", [1.0, 3.0])[0],
         sleep_max=config.get("sleep_between_batches", [1.0, 3.0])[1],
         max_rate_limit_delay=config.get("max_rate_limit_delay", 30.0),
+        backfill=args.backfill,
     )
 
 async def cmd_deepscrape(args):
-    """Run deep scrape workflow to find oldest review dates."""
+    """Run deep scrape workflow to find first review dates."""
     manager = ConfigManager()
     config = manager.get_config(args.config)
     if not config:
@@ -1434,7 +1748,8 @@ async def cmd_deepscrape(args):
     
     db_file = manager.get_db_file(args.config)
     await setup_db(db_file)
-    await deep_scrape_products(args.config, db_file, args.session_file, args.limit, args.concurrent)
+    await deep_scrape_products(args.config, db_file, limit=args.limit,
+                               concurrent=args.concurrent, force=args.force)
 
 async def cmd_download(args):
     """Run download free files workflow."""
@@ -1470,12 +1785,37 @@ async def cmd_stats(args):
         # Search results
         async with db.execute("SELECT COUNT(DISTINCT url) FROM search_results") as cursor:
             urls_found = (await cursor.fetchone())[0]
+
+        # Overlap between search combinations (search_hits exists only on DBs created/migrated by setup_db)
+        try:
+            async with db.execute("SELECT COUNT(*), COUNT(DISTINCT product_id) FROM search_hits") as cursor:
+                total_hits, hit_products = await cursor.fetchone()
+            async with db.execute("""
+                SELECT SUM(n_hits = 1), SUM(n_hits BETWEEN 2 AND 5), SUM(n_hits > 5)
+                FROM product_search_summary
+            """) as cursor:
+                hits_1, hits_2_5, hits_6p = [v or 0 for v in await cursor.fetchone()]
+        except Exception:
+            total_hits = hit_products = hits_1 = hits_2_5 = hits_6p = 0
         
         # Metadata scraped
         async with db.execute("SELECT COUNT(*) FROM product_metadata") as cursor:
             metadata_count = (await cursor.fetchone())[0]
+
+        # Apollo-state / first-review coverage (columns added by migration)
+        async with db.execute("SELECT COUNT(*) FROM product_metadata WHERE post_date IS NOT NULL") as cursor:
+            post_date_count = (await cursor.fetchone())[0]
+        async with db.execute("""
+            SELECT
+              SUM(CASE WHEN first_review_date NOT IN ('no_reviews') AND first_review_date IS NOT NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN first_review_date IS NULL AND CAST(number_of_ratings AS INTEGER) > 0 THEN 1 ELSE 0 END)
+            FROM product_metadata
+        """) as cursor:
+            row = await cursor.fetchone()
+            first_review_count = row[0] or 0
+            first_review_pending = row[1] or 0
         
-        # Downloads — failure_reason column added by migration; may not exist on older DBs
+        # Downloads - failure_reason column added by migration; may not exist on older DBs
         async with db.execute("SELECT COUNT(*), SUM(file_size) FROM downloads WHERE file_path IS NOT NULL") as cursor:
             row = await cursor.fetchone()
             downloads_count = row[0]
@@ -1500,7 +1840,12 @@ async def cmd_stats(args):
     print(f"STATISTICS - Configuration: {args.config}")
     print(f"{'='*60}")
     print(f"URLs found in search:     {urls_found:,}")
+    if total_hits:
+        print(f"  search hits (all appearances): {total_hits:,} across {hit_products:,} products")
+        print(f"  seen in 1 combo: {hits_1:,} | 2-5 combos: {hits_2_5:,} | 6+ combos: {hits_6p:,}  (see view product_search_summary)")
     print(f"Metadata scraped:         {metadata_count:,}")
+    print(f"  with post_date:         {post_date_count:,}  (run 'scrape --backfill' to fill)")
+    print(f"  with first_review_date: {first_review_count:,}  ({first_review_pending:,} rated products pending 'deepscrape')")
     print(f"Free products available:  {free_products:,}")
     print(f"Files downloaded:         {downloads_count:,}")
     print(f"Download failures:        {failed_downloads:,}")
@@ -1521,8 +1866,11 @@ Examples:
   
   # Scrape metadata
   python tpt_scraper_refactored.py scrape classroom-mgmt
+
+  # Re-fetch existing products that predate the post_date / Apollo-state fields
+  python tpt_scraper_refactored.py scrape classroom-mgmt --backfill
   
-  # Deep scrape to find oldest review dates (uses Playwright)
+  # Deep scrape to find first review dates (GraphQL, no browser)
   python tpt_scraper_refactored.py deepscrape classroom-mgmt --limit 100
   
   # Download free products
@@ -1558,14 +1906,16 @@ Examples:
     scrape_parser = subparsers.add_parser("scrape", help="Scrape product metadata")
     scrape_parser.add_argument("config", help="Configuration name")
     scrape_parser.add_argument("--rescrape", action="store_true", help="Re-scrape ALL products, updating existing records")
+    scrape_parser.add_argument("--backfill", action="store_true",
+                               help="Re-scrape only existing products missing post_date (resumable)")
     scrape_parser.add_argument("--no-cache", action="store_true", dest="no_cache", help="Bypass HTTP cache for fresh fetches")
     
-    # Deep scrape (Playwright-based)
-    deepscrape_parser = subparsers.add_parser("deepscrape", help="Deep scrape to find oldest review dates (uses Playwright)")
+    # Deep scrape (evaluations GraphQL API)
+    deepscrape_parser = subparsers.add_parser("deepscrape", help="Find each rated product's first review date via the evaluations API")
     deepscrape_parser.add_argument("config", help="Configuration name")
-    deepscrape_parser.add_argument("--session-file", default="tpt_storage.json", help="Playwright session file")
-    deepscrape_parser.add_argument("--limit", type=int, help="Limit number of products to deep scrape")
-    deepscrape_parser.add_argument("--concurrent", type=int, default=3, help="Concurrent browser instances (default: 3)")
+    deepscrape_parser.add_argument("--limit", type=int, help="Limit number of products to query")
+    deepscrape_parser.add_argument("--concurrent", type=int, default=4, help="Concurrent API requests (default: 4)")
+    deepscrape_parser.add_argument("--force", action="store_true", help="Recompute first_review_date for ALL products")
     
     # Download
     download_parser = subparsers.add_parser("download", help="Download free products")
