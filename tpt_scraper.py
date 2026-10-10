@@ -13,6 +13,7 @@ import logging
 import aiosqlite
 import os
 import re
+import sys
 import argparse
 import time
 from pathlib import Path
@@ -23,7 +24,27 @@ from collections import deque
 from typing import Optional, Dict, Any, List, Tuple
 from config_manager import ConfigManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+# Console goes to stdout (not stderr) so PowerShell doesn't wrap the first line as
+# a NativeCommandError when redirecting. Non-cp1252 characters are replaced rather
+# than escaped; the per-run file log (see configure_run_logging) is the UTF-8 record.
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, stream=sys.stdout)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
+
+def configure_run_logging(command: str, config_name: Optional[str]) -> Optional[Path]:
+    """Add a UTF-8 file handler at logs/<command>_<config>_<timestamp>.log for this run."""
+    if command in ("config", "stats") or not config_name:
+        return None
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    path = log_dir / f"{command}_{config_name}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(handler)
+    logging.info(f"Logging to {path}")
+    return path
 
 ###########################
 # Database Setup          #
@@ -1972,6 +1993,7 @@ Examples:
     stats_parser.add_argument("config", help="Configuration name")
     
     args = parser.parse_args()
+    configure_run_logging(args.command, getattr(args, "config", None))
     
     # Route to appropriate command
     if args.command == "config":

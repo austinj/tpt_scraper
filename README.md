@@ -31,12 +31,14 @@ python tpt_scraper.py config create sel_v2 --template configs\sel_simple.json --
 
 # Run the stages in order. Each is safe to Ctrl+C and re-run.
 python tpt_scraper.py search     sel_v2
-python tpt_scraper.py scrape     sel_v2 *>> scrape_sel_v2.log
-python tpt_scraper.py deepscrape sel_v2 *>> deepscrape_sel_v2.log
+python tpt_scraper.py scrape     sel_v2
+python tpt_scraper.py deepscrape sel_v2
 python tpt_scraper.py stats      sel_v2
 ```
 
-Rough timings for the SEL configuration (~175k products, `concurrent_requests: 8`): search ~15 min, scrape ~10-12 h, deepscrape ~4 h. The scrape and deepscrape log one line per product, so redirecting to a file (`*>>`) is recommended; follow along with `Get-Content scrape_sel_v2.log -Wait -Tail 20`.
+Rough timings for the SEL configuration (~180k products, `concurrent_requests: 8`): search ~15 min, scrape ~12 h, deepscrape ~4 h.
+
+Every run also writes a UTF-8 log to `logs/<command>_<config>_<timestamp>.log` (one line per product for scrape/deepscrape). Treat that file as the record: the console may show `?` or `\uXXXX` for non-Latin titles depending on the terminal's code page, but the log file and the database hold the correct text. Follow a run with `Get-Content logs\scrape_sel_v2_*.log -Wait -Tail 20`.
 
 ## Configuration
 
