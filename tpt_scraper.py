@@ -217,7 +217,17 @@ async def setup_db(db_file: str):
 
 class AdaptiveRateLimiter:
     """Adaptive rate limiter that adjusts based on response times and errors.
-    Uses a lock so concurrent tasks are dispatched sequentially, not in bursts."""
+    Uses a lock so concurrent tasks are dispatched sequentially, not in bursts.
+
+    Block handling: a 403/429 (Cloudflare challenge or rate limit) calls
+    register_block(), which pauses *every* worker until a shared cool-down expires
+    (1 min, doubling per consecutive block, capped at 30 min) and then resumes at
+    half the previous speed. Hammering through a challenge only lengthens it."""
+
+    MIN_DELAY = 0.25            # floor on dispatch spacing (~4 req/s site-wide)
+    BLOCK_BASE_COOLDOWN = 60.0  # seconds; doubles with each consecutive block
+    BLOCK_MAX_COOLDOWN = 1800.0
+    BLOCK_RESET_AFTER = 300     # consecutive successes before the block counter resets
 
     def __init__(self, initial_delay=1.0, max_delay=30.0, error_threshold=0.1):
         self.current_delay = initial_delay
@@ -227,13 +237,40 @@ class AdaptiveRateLimiter:
         self.error_count = 0
         self.total_count = 0
         self._lock = asyncio.Lock()  # serialises request dispatch
+        self.blocked_until = 0.0
+        self.block_count = 0
+        self.total_blocks = 0
+        self._successes_since_block = 0
 
     def record_response(self, success: bool, response_time: float):
         """Record a response and its timing."""
         self.recent_responses.append((success, response_time, time.time()))
         self.total_count += 1
-        if not success:
+        if success:
+            self._successes_since_block += 1
+            if self.block_count and self._successes_since_block >= self.BLOCK_RESET_AFTER:
+                self.block_count = 0
+        else:
             self.error_count += 1
+
+    def register_block(self, status: int, url: str = "") -> float:
+        """Start (or extend) the shared cool-down after a 403/429. Returns seconds to wait."""
+        now = time.time()
+        if now < self.blocked_until:
+            return self.blocked_until - now  # another worker already reported this block
+        self.block_count += 1
+        self.total_blocks += 1
+        self._successes_since_block = 0
+        cooldown = min(self.BLOCK_BASE_COOLDOWN * (2 ** (self.block_count - 1)), self.BLOCK_MAX_COOLDOWN)
+        self.blocked_until = now + cooldown
+        # Resume slower than before; adjust_delay() will ease back down if the site allows
+        self.current_delay = min(max(self.current_delay * 2, 2.0), self.max_delay)
+        logging.warning(
+            f"HTTP {status} (blocked/challenged) - pausing ALL requests for {cooldown/60:.1f} min "
+            f"(block #{self.block_count} in a row, {self.total_blocks} total), then resuming at "
+            f"{self.current_delay:.2f}s between requests. {url}"
+        )
+        return cooldown
 
     def adjust_delay(self):
         """Adjust delay based on recent performance."""
@@ -247,16 +284,29 @@ class AdaptiveRateLimiter:
         if error_rate > self.error_threshold:
             self.current_delay = min(self.current_delay * 1.5, self.max_delay)
         elif error_rate < self.error_threshold / 2 and avg_response_time < 2.0:
-            self.current_delay = max(self.current_delay * 0.9, 0.1)
+            self.current_delay = max(self.current_delay * 0.9, self.MIN_DELAY)
 
         return self.current_delay
 
     async def wait(self):
-        """Acquire the lock, sleep for the current delay, then release.
-        This ensures requests are staggered even under high concurrency."""
+        """Acquire the lock, honour any active cool-down, sleep for the current
+        (jittered) delay, then release - so requests stay staggered under concurrency."""
         async with self._lock:
+            remaining = self.blocked_until - time.time()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
             delay = self.adjust_delay()
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay * random.uniform(0.7, 1.3))
+
+
+def looks_like_challenge(status: int, body: Optional[str]) -> bool:
+    """Cloudflare's bot challenge ("Just a moment...") usually arrives as a 403 and
+    occasionally as a 503 or even a 200 with the challenge page as the body."""
+    if status in (403, 429):
+        return True
+    if body and status in (200, 503) and ("Just a moment..." in body[:3000] or "cf-chl" in body[:5000]):
+        return True
+    return False
 
 ###########################
 # URL Building and Fetch  #
@@ -299,12 +349,24 @@ BROWSER_HEADERS = {
 }
 
 
-async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None, max_retries=3):
-    """Fetch a URL with retry logic."""
+class BlockedError(Exception):
+    """Raised inside fetch() when the response is a 403/429 or a Cloudflare challenge page."""
+
+
+async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None,
+                max_retries=3, max_block_retries=6):
+    """Fetch a URL with retry logic.
+
+    Ordinary failures (5xx, timeouts) retry up to max_retries with short backoff.
+    Blocks (403/429/challenge) are handled separately: they trigger the limiter's
+    shared cool-down and are retried up to max_block_retries times, so a transient
+    Cloudflare challenge pauses the run instead of failing it.
+    """
     retries = 0
+    block_retries = 0
     backoff = 1
     
-    while retries < max_retries:
+    while retries < max_retries and block_retries < max_block_retries:
         try:
             if rate_limiter:
                 await rate_limiter.wait()
@@ -316,27 +378,38 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
             async with async_timeout.timeout(30):
                 async with session.get(url, headers=BROWSER_HEADERS) as response:
                     response_time = time.time() - start_time
-                    
-                    if response.status == 200:
+                    status = response.status
+                    body = await response.text() if status in (200, 403, 429, 503) else None
+
+                    if looks_like_challenge(status, body):
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        raise BlockedError(status)
+                    if status == 200:
                         if rate_limiter:
                             rate_limiter.record_response(True, response_time)
-                        return await response.text()
-                    elif response.status == 429:
+                        return body
+                    elif status >= 500:
                         if rate_limiter:
                             rate_limiter.record_response(False, response_time)
-                        wait = int(response.headers.get("Retry-After", backoff * 4))
-                        logging.warning(f"Rate limited (429) - waiting {wait}s")
-                        await asyncio.sleep(wait)
-                        raise Exception(f"Rate limited (429)")
-                    elif response.status >= 500:
-                        if rate_limiter:
-                            rate_limiter.record_response(False, response_time)
-                        raise Exception(f"Server error {response.status}")
+                        raise Exception(f"Server error {status}")
                     else:
                         if rate_limiter:
                             rate_limiter.record_response(False, response_time)
-                        logging.warning(f"Unexpected HTTP {response.status} for {url}")
+                        logging.warning(f"Unexpected HTTP {status} for {url}")
                         return None
+
+        except BlockedError as e:
+            block_retries += 1
+            status = e.args[0]
+            if rate_limiter:
+                rate_limiter.register_block(status, url)
+                # The pause itself happens inside wait() on the next loop iteration,
+                # so every worker pauses together rather than each sleeping independently.
+            else:
+                cooldown = min(60.0 * (2 ** (block_retries - 1)), 1800.0)
+                logging.warning(f"HTTP {status} (blocked/challenged) - waiting {cooldown/60:.1f} min: {url}")
+                await asyncio.sleep(cooldown)
 
         except Exception as e:
             retries += 1
@@ -344,352 +417,362 @@ async def fetch(session, url, rate_limiter: Optional[AdaptiveRateLimiter] = None
             if retries < max_retries:
                 await asyncio.sleep(backoff)
                 backoff *= 2
-                
-    logging.error(f"Failed to fetch {url} after {max_retries} retries")
+
+    if block_retries >= max_block_retries:
+        logging.error(f"Still blocked after {max_block_retries} cool-downs; giving up on {url} for this run")
+    else:
+        logging.error(f"Failed to fetch {url} after {max_retries} retries")
     return None
 
 ###########################
-# Pre-flight check        #
+# GraphQL helpers         #
 ###########################
 
-async def preflight_check(config: Dict[str, Any]) -> Tuple[bool, set]:
-    """
-    Test one URL per unique base combination (grade×subject×price) before the full search.
-
-    Returns (ok, bad_keys) where:
-      - ok=False  → hard failure (403/429/connection error); caller should abort
-      - ok=True   → proceed; bad_keys is the set of base-combo tuples to skip
-    """
-    resource_types = config.get("resource_type", [""])
-    grade_levels   = config.get("grade_level", [""])
-    subjects       = config.get("subject", [""])
-    formats        = config.get("format", [""])
-    price_options  = config.get("price_options", [""])
-    supports_list  = config.get("supports", [""])
-    sort           = config.get("sorting_methods", ["Relevance"])[0]
-
-    probe_urls: Dict[tuple, str] = {}
-    for rt in resource_types:
-        for gl in grade_levels:
-            for sub in subjects:
-                for fmt in formats:
-                    for price in price_options:
-                        for sup in supports_list:
-                            key = (rt, gl, sub, fmt, price, sup)
-                            probe_urls[key] = build_page_url(
-                                rt, gl, sub, fmt, price, sup, sort, 1
-                            )
-
-    logging.info(f"Pre-flight: testing {len(probe_urls)} unique URL combinations...")
-
-    HARD_FAIL = {403, 429, 503}
-    bad_keys: set = set()
-    SELECTOR = PRODUCT_CARD_LINK_SELECTOR
-
-    async with aiohttp.ClientSession() as session:
-        for key, url in probe_urls.items():
-            try:
-                async with async_timeout.timeout(15):
-                    async with session.get(
-                        url, headers=BROWSER_HEADERS, allow_redirects=True
-                    ) as resp:
-                        status = resp.status
-                        if status in HARD_FAIL:
-                            logging.error(
-                                f"Pre-flight HARD FAIL HTTP {status}: {url}\n"
-                                f"  Looks like this IP is rate-limited or blocked. "
-                                f"Wait a few minutes then try again."
-                            )
-                            return False, set()
-                        elif status == 404:
-                            logging.warning(f"Pre-flight 404 - skipping: {url}")
-                            bad_keys.add(key)
-                        elif status == 200:
-                            html = await resp.text()
-                            count = len(BeautifulSoup(html, "lxml").select(SELECTOR))
-                            if count == 0:
-                                logging.warning(
-                                    f"Pre-flight 200 but 0 products - skipping: {url}"
-                                )
-                                bad_keys.add(key)
-                            else:
-                                logging.info(
-                                    f"Pre-flight OK ({count} products): {url}"
-                                )
-                        else:
-                            logging.warning(
-                                f"Pre-flight HTTP {status} - skipping: {url}"
-                            )
-                            bad_keys.add(key)
-                        await asyncio.sleep(0.5)
-            except Exception as e:
-                logging.error(
-                    f"Pre-flight connection error: {e}\n"
-                    f"  URL: {url}\n"
-                    f"  Check network and try again."
-                )
-                return False, set()
-
-    good = len(probe_urls) - len(bad_keys)
-    logging.info(
-        f"Pre-flight complete: {good}/{len(probe_urls)} valid"
-        + (f", {len(bad_keys)} skipped (404/empty)" if bad_keys else "")
-    )
-
-    if good == 0:
-        logging.error("Pre-flight: no valid URL combinations. Check your config.")
-        return False, set()
-
-    return True, bad_keys
+# TPT's public GraphQL gateway. The site's own front end uses it for browse-page
+# pagination and the reviews widget, so these calls look exactly like what a browser
+# tab does; the HTML browse pages, by contrast, sit behind a Cloudflare managed
+# challenge for deeper facet combinations (specific grade x subject x price).
+GATEWAY_GRAPHQL_URL = "https://www.teacherspayteachers.com/gateway/graphql"
+GRAPHQL_HEADERS = {
+    "User-Agent": BROWSER_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+    "Content-Type": "application/json",
+    "Origin": "https://www.teacherspayteachers.com",
+    "Referer": "https://www.teacherspayteachers.com/",
+}
 
 
-# Sort orders TPT's browse UI currently offers. Unknown values are not rejected by
-# the server - they silently fall back to Relevance, duplicating those requests.
-KNOWN_SORT_ORDERS = {"Relevance", "Rating", "Price-Asc", "Most-Recent"}
-
-
-async def check_sort_orders(config: Dict[str, Any], good_keys: List[tuple]) -> List[str]:
-    """
-    Return the config's sort orders minus any the server ignores.
-
-    Fetches page 1 of one valid base combination under each sort order and compares
-    the product sequence to the default (Relevance) ordering; an identical sequence
-    means the value is being ignored. Falls back to the configured list on error.
-    """
-    sort_orders = config.get("sorting_methods", ["Relevance"])
-    if len(sort_orders) <= 1 or not good_keys:
-        return sort_orders
-
-    unknown = [s for s in sort_orders if s not in KNOWN_SORT_ORDERS]
-    if unknown:
-        logging.warning(f"Sort orders not in the current TPT UI: {unknown} - verifying against the server")
-
-    rt, gl, sub, fmt, price, sup = good_keys[0]
-
-    def product_ids(html: str) -> List[str]:
-        soup = BeautifulSoup(html, "lxml")
-        return [extract_product_id(a.get("href", "")) or a.get("href", "")
-                for a in soup.select(PRODUCT_CARD_LINK_SELECTOR)]
-
-    sequences: Dict[str, List[str]] = {}
-    try:
-        async with aiohttp.ClientSession() as session:
-            for sort in dict.fromkeys(["Relevance"] + list(sort_orders)):
-                url = build_page_url(rt, gl, sub, fmt, price, sup, sort, 1)
-                async with async_timeout.timeout(15):
-                    async with session.get(url, headers=BROWSER_HEADERS, allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            logging.warning(f"Sort check: HTTP {resp.status} for {url}; skipping sort validation")
-                            return sort_orders
-                        sequences[sort] = product_ids(await resp.text())
-                await asyncio.sleep(0.5)
-    except Exception as e:
-        logging.warning(f"Sort check failed ({e}); using configured sort orders as-is")
-        return sort_orders
-
-    baseline = sequences.get("Relevance") or []
-    kept, dropped = [], []
-    for sort in sort_orders:
-        if sort != "Relevance" and baseline and sequences.get(sort) == baseline:
-            dropped.append(sort)
-        else:
-            kept.append(sort)
-    if dropped:
-        logging.warning(
-            f"Sort check: {dropped} return the same results as Relevance (server ignores them) - "
-            f"dropping to avoid duplicate requests. Valid sorts: {sorted(KNOWN_SORT_ORDERS)}"
-        )
-    else:
-        logging.info(f"Sort check: all {len(sort_orders)} sort orders produce distinct orderings")
-    return kept
+async def graphql_post(session, query: str, variables: dict, label: str,
+                       rate_limiter: Optional[AdaptiveRateLimiter] = None,
+                       max_retries: int = 3, max_block_retries: int = 6) -> Optional[dict]:
+    """POST one GraphQL operation. Returns the `data` dict, or None if the request
+    failed or the server returned errors. Blocks (403/429) use the limiter's shared
+    cool-down exactly as fetch() does."""
+    payload = {"query": query, "variables": variables}
+    backoff = 1
+    attempt = 0
+    block_retries = 0
+    while attempt < max_retries and block_retries < max_block_retries:
+        try:
+            if rate_limiter:
+                await rate_limiter.wait()
+            start_time = time.time()  # time the round-trip only (see fetch)
+            async with async_timeout.timeout(30):
+                async with session.post(GATEWAY_GRAPHQL_URL, json=payload, headers=GRAPHQL_HEADERS) as response:
+                    response_time = time.time() - start_time
+                    if response.status in (403, 429):
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        raise BlockedError(response.status)
+                    if response.status != 200:
+                        if rate_limiter:
+                            rate_limiter.record_response(False, response_time)
+                        raise Exception(f"HTTP {response.status}")
+                    body = await response.json(content_type=None)
+            if rate_limiter:
+                rate_limiter.record_response(True, response_time)
+            if body.get("errors"):
+                # Schema-level rejection (bad id, bad argument) - retrying won't help
+                logging.warning(f"[{label}] GraphQL errors: {json.dumps(body['errors'])[:300]}")
+                return None
+            data = body.get("data")
+            return data if isinstance(data, dict) else None
+        except BlockedError as e:
+            block_retries += 1
+            if rate_limiter:
+                rate_limiter.register_block(e.args[0], GATEWAY_GRAPHQL_URL)
+            else:
+                cooldown = min(60.0 * (2 ** (block_retries - 1)), 1800.0)
+                logging.warning(f"[{label}] HTTP {e.args[0]} (blocked) - waiting {cooldown/60:.1f} min")
+                await asyncio.sleep(cooldown)
+        except Exception as e:
+            attempt += 1
+            logging.debug(f"[{label}] GraphQL attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+    logging.error(f"[{label}] GraphQL request failed after retries")
+    return None
 
 
 ###########################
 # 1. SEARCH WORKFLOW      #
 ###########################
 
+# searchResources returns at most this many results per query, however you page it
+# (the HTML browse pages show the same cap as 42 pages x 24). Combinations larger than
+# this are truncated; that is why the config fans out over grades x subjects x prices.
+SEARCH_RESULT_CAP = 1000
+SEARCH_PAGE_SIZE = 1000  # one request fetches the whole cap
+
+# Config sort names -> ResourceSearchSortType enum values. Other enum members exist
+# (PRICE_DESC, RATING_COUNT) but the server returns Relevance ordering for them.
+SEARCH_SORT_TYPES = {
+    "Relevance": "RELEVANCE",
+    "Rating": "RATING",
+    "Price-Asc": "PRICE",
+    "Most-Recent": "MOST_RECENT",
+}
+
+SEARCH_QUERY = """
+query SearchResources($inputFacets: [String!]!, $pageNum: Int!, $sortType: ResourceSearchSortType, $resourcesPerPage: Int) {
+  searchResources(
+    inputFacets: $inputFacets
+    pageNum: $pageNum
+    sortType: $sortType
+    resourcesPerPage: $resourcesPerPage
+    query: ""
+    withFacets: []
+    withHighlights: false
+    withStores: false
+  ) {
+    totalCount
+    resources { id canonicalSlug }
+  }
+}
+"""
+
+
+def facet_slug(path: str) -> str:
+    """Config values are browse-URL path fragments ("elementary/preschool",
+    "social-emotional/character-education"). The search API keys on the final
+    segment only - the browse page for the full path issues the same facets."""
+    return path.strip("/").split("/")[-1] if path else ""
+
+
+def combo_facets(base: tuple) -> List[str]:
+    return [facet_slug(p) for p in base if p]
+
+
+async def fetch_search_results(session, facets: List[str], sort_type: str, page_num: int = 0,
+                               per_page: int = SEARCH_PAGE_SIZE,
+                               rate_limiter: Optional[AdaptiveRateLimiter] = None) -> Optional[dict]:
+    """One searchResources call. Returns {"totalCount": int, "resources": [{"id", "canonicalSlug"}]} or None."""
+    data = await graphql_post(
+        session, SEARCH_QUERY,
+        {"inputFacets": facets, "pageNum": page_num, "sortType": sort_type, "resourcesPerPage": per_page},
+        label=f"search {'/'.join(facets) or '(all)'} {sort_type} p{page_num}",
+        rate_limiter=rate_limiter,
+    )
+    result = (data or {}).get("searchResources")
+    return result if isinstance(result, dict) and isinstance(result.get("resources"), list) else None
+
+
+async def validate_search_config(session, config: Dict[str, Any],
+                                 rate_limiter: AdaptiveRateLimiter) -> Optional[Tuple[int, List[str]]]:
+    """
+    Pre-flight for the search: one unfaceted query (connectivity + global total),
+    then one query per distinct facet slug and per sort order.
+
+    A facet slug the API does not recognise is silently ignored - the query returns
+    the whole catalogue - so every slug must narrow the global total or we abort.
+    Sort orders must map to a known enum value and produce an ordering distinct from
+    Relevance; ones that don't are dropped with a warning.
+
+    Returns (global_total, usable_sort_orders) or None on hard failure.
+    """
+    base = await fetch_search_results(session, [], "RELEVANCE", per_page=1, rate_limiter=rate_limiter)
+    if not base or not base.get("totalCount"):
+        logging.error("Pre-flight: searchResources returned nothing. If this was a block, wait and re-run.")
+        return None
+    global_total = base["totalCount"]
+    logging.info(f"Pre-flight OK: catalogue total {global_total:,} resources")
+
+    slugs = sorted({facet_slug(v) for key in ("resource_type", "grade_level", "subject", "format", "price_options", "supports")
+                    for v in config.get(key, [""]) if v})
+    bad = []
+    for slug in slugs:
+        r = await fetch_search_results(session, [slug], "RELEVANCE", per_page=1, rate_limiter=rate_limiter)
+        if r is None:
+            logging.warning(f"Facet check: no response for '{slug}'; continuing")
+            continue
+        if r["totalCount"] >= global_total:
+            bad.append(slug)
+        else:
+            logging.info(f"Facet check OK: {slug:28} {r['totalCount']:>10,}")
+    if bad:
+        logging.error(f"Facet check: the API does not recognise {bad} (each returns the whole catalogue). "
+                      f"Fix the config - searching with them would silently return unfiltered results.")
+        return None
+
+    sort_orders = config.get("sorting_methods", ["Relevance"])
+    unknown = [s for s in sort_orders if s not in SEARCH_SORT_TYPES]
+    if unknown:
+        logging.warning(f"Sort check: {unknown} are not supported by the API - dropping. "
+                        f"Valid: {sorted(SEARCH_SORT_TYPES)}")
+        sort_orders = [s for s in sort_orders if s in SEARCH_SORT_TYPES]
+    if len(sort_orders) > 1:
+        first_base = next(iter(
+            (rt, gl, sub, fmt, pr, sup)
+            for rt in config.get("resource_type", [""]) for gl in config.get("grade_level", [""])
+            for sub in config.get("subject", [""]) for fmt in config.get("format", [""])
+            for pr in config.get("price_options", [""]) for sup in config.get("supports", [""])
+        ))
+        facets = combo_facets(first_base)
+        sequences = {}
+        for s in sort_orders:
+            r = await fetch_search_results(session, facets, SEARCH_SORT_TYPES[s], per_page=8, rate_limiter=rate_limiter)
+            sequences[s] = [x["id"] for x in r["resources"]] if r else None
+        baseline = sequences.get("Relevance")
+        dropped = [s for s in sort_orders if s != "Relevance" and baseline and sequences.get(s) == baseline]
+        if dropped:
+            logging.warning(f"Sort check: {dropped} return Relevance ordering - dropping to avoid duplicate queries")
+            sort_orders = [s for s in sort_orders if s not in dropped]
+        else:
+            logging.info(f"Sort check: all {len(sort_orders)} sort orders produce distinct orderings")
+    if not sort_orders:
+        logging.error("Sort check: no usable sort orders")
+        return None
+    return global_total, sort_orders
+
+
 async def search_urls(config_name: str, config: Dict[str, Any], db_file: str):
     """
-    Search for product URLs based on configuration.
-    Discovers all product URLs matching the search criteria.
+    Discover product URLs via the searchResources GraphQL API.
+
+    One request per (facet combination x sort order) returns that query's full
+    result set (up to SEARCH_RESULT_CAP). Resumable: finished queries are recorded
+    in search_queries and skipped on re-run; failed/blocked ones are not recorded.
     """
     logging.info(f"=" * 60)
     logging.info(f"SEARCH WORKFLOW - Configuration: {config_name}")
     logging.info(f"=" * 60)
 
-    # Extract configuration
-    resource_types = config.get("resource_type", [""])
-    grade_levels = config.get("grade_level", [""])
-    subjects = config.get("subject", [""])
-    formats = config.get("format", [""])
-    price_options = config.get("price_options", [""])
-    supports = config.get("supports", [""])
-    sorting_methods = config.get("sorting_methods", ["Relevance"])
-    total_pages = config.get("total_pages", 42)
     concurrent_requests = config.get("concurrent_requests", 8)
     batch_size = config.get("batch_size", 100)
     sleep_min, sleep_max = config.get("sleep_between_batches", [1.0, 3.0])
     max_rate_limit_delay = config.get("max_rate_limit_delay", 30.0)
-    
-    # Generate all combinations
-    combinations = [
-        (resource_type, grade_level, subject, format_type, price_option, supports_val, sort_order, page)
-        for resource_type in resource_types
-        for grade_level in grade_levels
-        for subject in subjects
-        for format_type in formats
-        for price_option in price_options
-        for supports_val in supports
-        for sort_order in sorting_methods
-        for page in range(1, total_pages + 1)
+
+    base_combos = [
+        (rt, gl, sub, fmt, pr, sup)
+        for rt in config.get("resource_type", [""])
+        for gl in config.get("grade_level", [""])
+        for sub in config.get("subject", [""])
+        for fmt in config.get("format", [""])
+        for pr in config.get("price_options", [""])
+        for sup in config.get("supports", [""])
     ]
 
-    # Pre-flight: verify base URLs before committing to the full run
-    ok, bad_keys = await preflight_check(config)
-    if not ok:
-        logging.error("Search aborted due to pre-flight failure.")
-        return
-
-    # Drop sort orders the server ignores (they would just re-fetch the Relevance pages)
-    good_keys = [k for k in dict.fromkeys((c[0], c[1], c[2], c[3], c[4], c[5]) for c in combinations)
-                 if k not in bad_keys]
-    sorting_methods = await check_sort_orders(config, good_keys)
-
-    before = len(combinations)
-    combinations = [
-        c for c in combinations
-        if (c[0], c[1], c[2], c[3], c[4], c[5]) not in bad_keys and c[6] in sorting_methods
-    ]
-    if before != len(combinations):
-        logging.info(
-            f"Pre-flight filtered {before - len(combinations):,} combinations "
-            f"({len(combinations):,} remaining)"
-        )
-    
-    # Check what's already been searched
-    async with aiosqlite.connect(db_file) as db:
-        # Create a temp table to track searched combinations
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS searched_combinations (
-                resource_type TEXT,
-                grade_level TEXT,
-                subject TEXT,
-                format TEXT,
-                price_option TEXT,
-                supports TEXT,
-                sort_order TEXT,
-                page INTEGER,
-                PRIMARY KEY(resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
-            )
-        """)
-        
-        async with db.execute("SELECT * FROM searched_combinations") as cursor:
-            searched = set(await cursor.fetchall())
-    
-    remaining = [c for c in combinations if c not in searched]
-    
-    logging.info(f"Total combinations: {len(combinations):,}")
-    logging.info(f"Already searched: {len(searched):,}")
-    logging.info(f"Remaining: {len(remaining):,}")
-    
-    if not remaining:
-        logging.info("All combinations already searched!")
-        return
-    
-    # Initialize components
-    rate_limiter = AdaptiveRateLimiter(initial_delay=1.0, max_delay=max_rate_limit_delay)
+    rate_limiter = AdaptiveRateLimiter(initial_delay=0.5, max_delay=max_rate_limit_delay)
     semaphore = asyncio.Semaphore(concurrent_requests)
-
-    connector = aiohttp.TCPConnector(
-        limit=concurrent_requests + 10,
-        limit_per_host=concurrent_requests,
-        keepalive_timeout=30
-    )
+    connector = aiohttp.TCPConnector(limit=concurrent_requests + 10, limit_per_host=concurrent_requests, keepalive_timeout=30)
     timeout = aiohttp.ClientTimeout(total=60, connect=10)
 
-    async def search_page(combo):
-        """Search a single page and store results."""
-        resource_type, grade_level, subject, format_type, price_option, supports_val, sort_order, page = combo
-        
+    async with aiosqlite.connect(db_file) as db:
+        # One row per completed (combination x sort) query. Replaces the HTML-era
+        # searched_combinations / search_combo_totals tables (left in place if present).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS search_queries (
+                resource_type TEXT, grade_level TEXT, subject TEXT, format TEXT, price_option TEXT, supports TEXT,
+                sort_order TEXT,
+                facets TEXT,
+                total_count INTEGER,
+                returned INTEGER,
+                capped INTEGER,
+                searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(resource_type, grade_level, subject, format, price_option, supports, sort_order)
+            )
+        """)
+        await db.commit()
+
+    async def run_query(session, base: tuple, sort_name: str) -> Optional[Tuple[int, int, int]]:
+        """Fetch one (combination x sort), store products, record the query.
+        Returns (returned, total_count, new_urls) or None on failure."""
+        facets = combo_facets(base)
         async with semaphore:
-            url = build_page_url(resource_type, grade_level, subject, format_type, price_option, supports_val, sort_order, page)
-            logging.info(f"Searching: {url}")
-            
-            html = await fetch(session, url, rate_limiter)
-            if not html:
-                return []
-            
-            soup = BeautifulSoup(html, "lxml")
-            product_elements = soup.select(PRODUCT_CARD_LINK_SELECTOR)
-            
-            urls_found = []
-            for rank, product in enumerate(product_elements, start=1):
-                href = product.get("href")
-                if href:
-                    full_url = f"https://www.teacherspayteachers.com{href}" if not href.startswith("http") else href
-                    urls_found.append((
-                        full_url, extract_product_id(full_url), resource_type, grade_level, subject, format_type,
-                        price_option, supports_val, sort_order, page, rank
-                    ))
-            
-            # Store results
+            result = await fetch_search_results(session, facets, SEARCH_SORT_TYPES[sort_name], rate_limiter=rate_limiter)
+            if result is None:
+                return None  # not recorded -> retried on the next run
+
+            total = result.get("totalCount") or 0
+            resources = [r for r in result["resources"] if r.get("canonicalSlug")]
+            rows = []
+            for rank, r in enumerate(resources, start=1):
+                url = f"https://www.teacherspayteachers.com/Product/{r['canonicalSlug']}"
+                rows.append((url, str(r["id"]), *base, sort_name, 1, rank))
+
+            new_urls = 0
             async with aiosqlite.connect(db_file) as db:
-                for (full_url, product_id, *combo_fields, rank) in urls_found:
-                    # First-seen record (unique per URL) - downstream stages read this table
-                    await db.execute("""
-                        INSERT OR IGNORE INTO search_results 
+                for (url, product_id, *combo_fields, page, rank) in rows:
+                    cur = await db.execute("""
+                        INSERT OR IGNORE INTO search_results
                         (url, product_id, resource_type, grade_level, subject, format, price_option, supports, sort_order, page)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (full_url, product_id, *combo_fields))
-                    # Every appearance, for overlap analysis
-                    if product_id:
-                        await db.execute("""
-                            INSERT OR IGNORE INTO search_hits
-                            (product_id, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, rank_on_page)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (product_id, full_url, *combo_fields, rank))
-                
-                # Mark combination as searched
+                    """, (url, product_id, *combo_fields, page))
+                    new_urls += cur.rowcount
+                    await db.execute("""
+                        INSERT OR IGNORE INTO search_hits
+                        (product_id, url, resource_type, grade_level, subject, format, price_option, supports, sort_order, page, rank_on_page)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (product_id, url, *combo_fields, page, rank))
                 await db.execute("""
-                    INSERT OR IGNORE INTO searched_combinations 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, combo)
-                
+                    INSERT OR REPLACE INTO search_queries
+                    (resource_type, grade_level, subject, format, price_option, supports, sort_order, facets, total_count, returned, capped)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (*base, sort_name, "/".join(facets), total, len(resources), int(total > SEARCH_RESULT_CAP)))
                 await db.commit()
-            
-            return urls_found
-    
-    async with aiohttp_client_cache.CachedSession(
-        cache_name="aiohttp_cache", 
-        expire_after=3600,
-        connector=connector,
-        timeout=timeout
-    ) as session:
-        
-        # Process in batches
-        batch_size = config.get("batch_size", 100)  # use config value
-        for i in range(0, len(remaining), batch_size):
-            batch = remaining[i:i+batch_size]
-            logging.info(f"Processing batch {i//batch_size + 1}/{(len(remaining) + batch_size - 1)//batch_size}")
-            
-            tasks = [search_page(combo) for combo in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            total_urls = sum(len(r) for r in results if not isinstance(r, Exception))
-            logging.info(f"Found {total_urls} URLs in this batch")
-            
-            # Sleep between batches
-            if i + batch_size < len(remaining):
-                await asyncio.sleep(random.uniform(sleep_min, sleep_max))
-    
-    # Final stats
+
+            logging.info(f"Search {'/'.join(facets) or '(all)':60} {sort_name:11} total={total:>8,} got={len(resources):>5} new={new_urls:>5}")
+            return len(resources), total, new_urls
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+
+        checked = await validate_search_config(session, config, rate_limiter)
+        if checked is None:
+            logging.error("Search aborted due to pre-flight failure.")
+            return
+        _, sort_orders = checked
+
+        async with aiosqlite.connect(db_file) as db:
+            async with db.execute("""SELECT resource_type, grade_level, subject, format, price_option, supports, sort_order
+                                     FROM search_queries""") as cursor:
+                done = set(await cursor.fetchall())
+
+        queries = [(base, s) for base in base_combos for s in sort_orders]
+        remaining = [(b, s) for b, s in queries if (*b, s) not in done]
+        logging.info(f"Queries: {len(queries):,} combination x sort pairs; {len(done):,} already done; {len(remaining):,} to run")
+        if not remaining:
+            logging.info("All queries already done!")
+        else:
+            failed = 0
+            new_total = 0
+            start = time.time()
+            n_batches = (len(remaining) + batch_size - 1) // batch_size
+            for i in range(0, len(remaining), batch_size):
+                batch = remaining[i:i + batch_size]
+                results = await asyncio.gather(*(run_query(session, b, s) for b, s in batch), return_exceptions=True)
+                failed += sum(1 for r in results if r is None or isinstance(r, Exception))
+                new_total += sum(r[2] for r in results if isinstance(r, tuple))
+                processed = i + len(batch)
+                elapsed = time.time() - start
+                rate = processed / elapsed if elapsed else 0
+                eta = (len(remaining) - processed) / rate if rate else 0
+                logging.info(
+                    f"Progress: {processed:,}/{len(remaining):,} queries | batch {i // batch_size + 1}/{n_batches} | "
+                    f"new URLs so far: {new_total:,} | failed: {failed:,} | "
+                    f"Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s | ETA: {int(eta // 60)}m {int(eta % 60)}s"
+                    + (f" | blocks: {rate_limiter.total_blocks}" if rate_limiter.total_blocks else "")
+                )
+                if i + batch_size < len(remaining):
+                    await asyncio.sleep(random.uniform(sleep_min, sleep_max))
+
     async with aiosqlite.connect(db_file) as db:
         async with db.execute("SELECT COUNT(DISTINCT url) FROM search_results") as cursor:
             total_urls = (await cursor.fetchone())[0]
-    
+        async with db.execute("SELECT COUNT(*), SUM(capped) FROM search_queries") as cursor:
+            n_done, n_capped = await cursor.fetchone()
+
+    pending = len(queries) - n_done if 'queries' in locals() else 0
     logging.info(f"=" * 60)
     logging.info(f"SEARCH COMPLETE")
     logging.info(f"Total unique URLs found: {total_urls:,}")
+    logging.info(f"Queries done: {n_done:,}; {n_capped or 0:,} of them hit the {SEARCH_RESULT_CAP:,}-result cap "
+                 f"(their remaining products are only reachable through other combinations)")
+    if pending > 0:
+        logging.warning(f"{pending:,} queries did not complete (blocked/failed) - re-run 'search' to finish them")
+    if rate_limiter.total_blocks:
+        logging.warning(f"Encountered {rate_limiter.total_blocks} block(s) during this run")
     logging.info(f"=" * 60)
 
 ###########################
@@ -1083,7 +1166,6 @@ async def scrape_metadata(config_name: str, db_file: str, concurrent_requests: i
 # page at 100 and reports totalCount as at most 10,000, but offsets past 10,000
 # still return rows, so jumping to `number_of_ratings - 100` sorted by mostRecent
 # lands on the oldest reviews in a single request.
-GATEWAY_GRAPHQL_URL = "https://www.teacherspayteachers.com/gateway/graphql"
 EVALUATIONS_PAGE_SIZE = 100
 EVALUATIONS_MAX_BACKSTEPS = 5    # when number_of_ratings overshoots the real count
 EVALUATIONS_MAX_FOLLOW_PAGES = 20  # when new reviews arrived since the metadata scrape
@@ -1101,14 +1183,6 @@ query FirstReview($resourceId: ID!, $first: Int, $after: String) {
   }
 }
 """
-GRAPHQL_HEADERS = {
-    "User-Agent": BROWSER_HEADERS["User-Agent"],
-    "Accept": "*/*",
-    "Accept-Language": BROWSER_HEADERS["Accept-Language"],
-    "Content-Type": "application/json",
-    "Origin": "https://www.teacherspayteachers.com",
-    "Referer": "https://www.teacherspayteachers.com/",
-}
 
 
 def encode_evaluations_cursor(offset: int) -> Optional[str]:
@@ -1120,50 +1194,16 @@ def encode_evaluations_cursor(offset: int) -> Optional[str]:
 
 
 async def fetch_evaluations_page(session, product_id: str, after: Optional[str],
-                                 rate_limiter: Optional[AdaptiveRateLimiter] = None,
-                                 max_retries: int = 3) -> Optional[dict]:
+                                 rate_limiter: Optional[AdaptiveRateLimiter] = None) -> Optional[dict]:
     """POST one page of the evaluations query. Returns the connection dict
-    (totalCount / pageInfo / edges) or None after exhausting retries."""
-    payload = {
-        "query": EVALUATIONS_QUERY,
-        "variables": {"resourceId": str(product_id), "first": EVALUATIONS_PAGE_SIZE, "after": after},
-    }
-    backoff = 1
-    for attempt in range(1, max_retries + 1):
-        try:
-            if rate_limiter:
-                await rate_limiter.wait()
-            start_time = time.time()  # time the round-trip only (see fetch)
-            async with async_timeout.timeout(30):
-                async with session.post(GATEWAY_GRAPHQL_URL, json=payload, headers=GRAPHQL_HEADERS) as response:
-                    response_time = time.time() - start_time
-                    if response.status == 429:
-                        if rate_limiter:
-                            rate_limiter.record_response(False, response_time)
-                        wait = int(response.headers.get("Retry-After", backoff * 4))
-                        logging.warning(f"[{product_id}] GraphQL rate limited (429) - waiting {wait}s")
-                        await asyncio.sleep(wait)
-                        raise Exception("Rate limited (429)")
-                    if response.status != 200:
-                        if rate_limiter:
-                            rate_limiter.record_response(False, response_time)
-                        raise Exception(f"HTTP {response.status}")
-                    body = await response.json(content_type=None)
-            if rate_limiter:
-                rate_limiter.record_response(True, response_time)
-            if body.get("errors"):
-                # Schema-level rejection (bad id, bad argument) - retrying won't help
-                logging.warning(f"[{product_id}] GraphQL errors: {json.dumps(body['errors'])[:300]}")
-                return None
-            connection = (body.get("data") or {}).get("filterEvaluationsByResource")
-            return connection if isinstance(connection, dict) else None
-        except Exception as e:
-            logging.debug(f"[{product_id}] GraphQL attempt {attempt}/{max_retries} failed: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(backoff)
-                backoff *= 2
-    logging.error(f"[{product_id}] GraphQL request failed after {max_retries} retries")
-    return None
+    (totalCount / pageInfo / edges) or None on failure."""
+    data = await graphql_post(
+        session, EVALUATIONS_QUERY,
+        {"resourceId": str(product_id), "first": EVALUATIONS_PAGE_SIZE, "after": after},
+        label=product_id, rate_limiter=rate_limiter,
+    )
+    connection = (data or {}).get("filterEvaluationsByResource")
+    return connection if isinstance(connection, dict) else None
 
 
 async def fetch_first_review_date(session, product_id: str, review_count: int,

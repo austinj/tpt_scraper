@@ -333,77 +333,180 @@ class TestURLBuilding:
 
 
 class TestSearchWorkflow:
-    """Test the search workflow."""
-    
-    @pytest.mark.asyncio
-    async def test_search_urls_creates_combinations(self, temp_db_file, sample_config):
-        """Test that search generates correct combinations."""
-        await scraper.setup_db(temp_db_file)
-        
-        # Mock the actual HTTP fetching
-        with patch('tpt_scraper.aiohttp_client_cache.CachedSession') as mock_session:
-            mock_session_instance = AsyncMock()
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session_instance)
-            mock_session.__aexit__ = AsyncMock()
-            
-            with patch('tpt_scraper.fetch', new_callable=AsyncMock) as mock_fetch:
-                mock_fetch.return_value = '<html><body></body></html>'
-                
-                # Run with limited config to avoid too many combinations
-                limited_config = {
-                    "resource_type": ["teacher-tools"],
-                    "grade_level": ["elementary/kindergarten"],
-                    "subject": ["social-emotional"],
-                    "format": [""],
-                    "price_options": ["free"],
-                    "supports": [""],
-                    "sorting_methods": ["Relevance"],
-                    "total_pages": 2,
-                    "concurrent_requests": 5
-                }
-                
-                # We can't easily test the full function due to async complexity,
-                # but we can test components
-                
-                # Test that combinations are generated correctly
-                expected_combos = 1 * 1 * 1 * 1 * 1 * 1 * 1 * 2  # = 2 combinations
-                assert expected_combos == 2
+    """Search via the searchResources GraphQL API."""
+
+    GLOBAL_TOTAL = 17_000_000
+
+    @staticmethod
+    def _fake_api(facet_totals, sequences_by_sort=None):
+        """Build a fake fetch_search_results. facet_totals maps a facets tuple to
+        (totalCount, [ids]); unknown slugs behave like the real API (whole catalogue)."""
+        calls = []
+
+        async def fake(session, facets, sort_type, page_num=0, per_page=1000, rate_limiter=None):
+            calls.append((tuple(facets), sort_type, per_page))
+            if not facets:
+                return {"totalCount": TestSearchWorkflow.GLOBAL_TOTAL, "resources": [{"id": "1", "canonicalSlug": "x-1"}]}
+            if any(f not in {"elementary", "preschool", "character-education", "free"} for f in facets):
+                return {"totalCount": TestSearchWorkflow.GLOBAL_TOTAL + 5, "resources": []}
+            total, ids = facet_totals.get(tuple(facets), (3, ["10", "11", "12"]))
+            if sequences_by_sort and sort_type in sequences_by_sort:
+                ids = sequences_by_sort[sort_type]
+            ids = ids[:per_page]
+            return {"totalCount": total, "resources": [{"id": i, "canonicalSlug": f"Title-{i}"} for i in ids]}
+        return fake, calls
+
+    def test_facet_slug_mapping(self):
+        assert scraper.facet_slug("elementary/preschool") == "preschool"
+        assert scraper.facet_slug("social-emotional/character-education") == "character-education"
+        assert scraper.facet_slug("free") == "free"
+        assert scraper.facet_slug("") == ""
+        assert scraper.combo_facets(("", "elementary/preschool", "social-emotional/character-education", "", "free", "")) == \
+            ["preschool", "character-education", "free"]
+        assert scraper.combo_facets(("", "", "", "", "", "")) == []
 
     @pytest.mark.asyncio
-    async def test_check_sort_orders_drops_ignored_sorts(self):
-        """A sort whose page-1 sequence equals Relevance is dropped; distinct ones are kept."""
-        def page(ids):
-            links = "".join(f'<a class="ProductRowCard-module__cardTitleLink--abc" href="/Product/t-{i}"></a>' for i in ids)
-            return f"<html><body>{links}</body></html>"
-        by_sort = {
-            None: page([1, 2, 3]),             # Relevance (no order= param)
-            "Rating": page([3, 1, 2]),
-            "Rating-Count": page([1, 2, 3]),   # ignored by server -> same as Relevance
-            "Price-Asc": page([2, 3, 1]),
+    async def test_validate_rejects_unknown_facet(self):
+        fake, calls = self._fake_api({})
+        config = {"grade_level": ["elementary/preschool"], "subject": ["social-emotional/typo-subject"],
+                  "price_options": [""], "sorting_methods": ["Relevance"]}
+        with patch("tpt_scraper.fetch_search_results", side_effect=fake):
+            assert await scraper.validate_search_config(object(), config, scraper.AdaptiveRateLimiter()) is None
+        assert (("typo-subject",), "RELEVANCE", 1) in calls
+
+    @pytest.mark.asyncio
+    async def test_validate_drops_unknown_and_duplicate_sorts(self):
+        fake, _ = self._fake_api({}, sequences_by_sort={
+            "RELEVANCE": ["1", "2", "3"], "RATING": ["3", "1", "2"], "PRICE": ["1", "2", "3"]})  # PRICE == Relevance
+        config = {"grade_level": ["elementary"], "subject": ["social-emotional/character-education"], "price_options": ["free"],
+                  "sorting_methods": ["Relevance", "Rating", "Price-Asc", "Rating-Count"]}
+        with patch("tpt_scraper.fetch_search_results", side_effect=fake):
+            total, sorts = await scraper.validate_search_config(object(), config, scraper.AdaptiveRateLimiter())
+        assert total == self.GLOBAL_TOTAL
+        assert sorts == ["Relevance", "Rating"]   # Rating-Count unknown, Price-Asc duplicate of Relevance
+
+    @pytest.mark.asyncio
+    async def test_search_urls_end_to_end_and_resume(self, temp_db_file):
+        await scraper.setup_db(temp_db_file)
+        totals = {
+            ("preschool", "character-education", "free"): (1500, [str(i) for i in range(1, 1201)]),  # over the cap
+            ("elementary", "character-education", "free"): (2, ["1", "5000"]),                        # overlaps product 1
         }
+        fake, calls = self._fake_api(totals)
+        config = {"grade_level": ["elementary/preschool", "elementary"], "subject": ["social-emotional/character-education"],
+                  "price_options": ["free"], "sorting_methods": ["Relevance"], "concurrent_requests": 2, "batch_size": 10,
+                  "sleep_between_batches": [0, 0]}
+
+        class _Session:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        with patch("tpt_scraper.fetch_search_results", side_effect=fake), \
+             patch("tpt_scraper.aiohttp.ClientSession", return_value=_Session()), \
+             patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
+            await scraper.search_urls("t", config, temp_db_file)
+
+        async with aiosqlite.connect(temp_db_file) as db:
+            async with db.execute("SELECT COUNT(*) FROM search_results") as cur:
+                assert (await cur.fetchone())[0] == 1001          # 1000 (cap) + product 5000 (product 1 deduped)
+            async with db.execute("SELECT url, product_id FROM search_results WHERE product_id='5000'") as cur:
+                assert await cur.fetchone() == ("https://www.teacherspayteachers.com/Product/Title-5000", "5000")
+            async with db.execute("SELECT COUNT(*) FROM search_hits") as cur:
+                assert (await cur.fetchone())[0] == 1002          # every appearance kept
+            async with db.execute("SELECT n_hits, grade_levels FROM product_search_summary WHERE product_id='1'") as cur:
+                n_hits, grades = await cur.fetchone()
+                assert n_hits == 2 and set(grades.split(",")) == {"elementary/preschool", "elementary"}
+            async with db.execute("SELECT facets, total_count, returned, capped FROM search_queries ORDER BY facets") as cur:
+                rows = await cur.fetchall()
+            assert rows == [("elementary/character-education/free", 2, 2, 0),
+                            ("preschool/character-education/free", 1500, 1000, 1)]
+
+        # Re-running performs no further search queries (pre-flight calls only)
+        n_search_calls_before = sum(1 for c in calls if c[2] == scraper.SEARCH_PAGE_SIZE)
+        with patch("tpt_scraper.fetch_search_results", side_effect=fake), \
+             patch("tpt_scraper.aiohttp.ClientSession", return_value=_Session()), \
+             patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
+            await scraper.search_urls("t", config, temp_db_file)
+        assert sum(1 for c in calls if c[2] == scraper.SEARCH_PAGE_SIZE) == n_search_calls_before
+
+
+class TestBlockHandling:
+    """403/429/Cloudflare challenges pause every worker via the shared limiter instead of failing the run."""
+
+    def test_looks_like_challenge(self):
+        assert scraper.looks_like_challenge(403, None)
+        assert scraper.looks_like_challenge(429, "")
+        assert scraper.looks_like_challenge(200, "<html><title>Just a moment...</title></html>")
+        assert scraper.looks_like_challenge(503, "<div id='cf-chl-widget'></div>")
+        assert not scraper.looks_like_challenge(200, "<html>products</html>")
+        assert not scraper.looks_like_challenge(500, None)
+
+    def test_register_block_escalates_and_slows(self):
+        rl = scraper.AdaptiveRateLimiter(initial_delay=0.3)
+        rl.blocked_until = 0.0
+        c1 = rl.register_block(403, "u")
+        assert c1 == rl.BLOCK_BASE_COOLDOWN and rl.block_count == 1
+        assert rl.current_delay >= 2.0                      # resumes slower
+        rl.blocked_until = 0.0                              # pretend the cool-down elapsed
+        c2 = rl.register_block(403, "u")
+        assert c2 == rl.BLOCK_BASE_COOLDOWN * 2 and rl.block_count == 2
+        # A second worker reporting during an active cool-down does not extend it
+        before = rl.blocked_until
+        rl.register_block(403, "u")
+        assert rl.blocked_until == before and rl.block_count == 2
+        # Sustained success resets the escalation
+        for _ in range(rl.BLOCK_RESET_AFTER):
+            rl.record_response(True, 0.1)
+        assert rl.block_count == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_honours_cooldown(self):
+        rl = scraper.AdaptiveRateLimiter(initial_delay=0.0)
+        rl.blocked_until = 12345.0
+        with patch("tpt_scraper.time.time", return_value=12300.0), \
+             patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await rl.wait()
+        assert sleep.call_args_list[0].args[0] == 45.0  # waited out the remaining cool-down first
+
+    @pytest.mark.asyncio
+    async def test_fetch_retries_after_block_then_succeeds(self):
+        statuses = iter([403, 200])
 
         class _Resp:
-            def __init__(self, body): self.status, self._body = 200, body
-            async def text(self): return self._body
+            def __init__(self, status): self.status, self.headers = status, {}
+            async def text(self): return "<html>ok</html>" if self.status == 200 else "Just a moment..."
             async def __aenter__(self): return self
             async def __aexit__(self, *a): return False
 
         class _Session:
-            def get(self, url, headers=None, allow_redirects=True):
-                import urllib.parse as up
-                q = up.parse_qs(up.urlparse(url).query)
-                return _Resp(by_sort[q.get("order", [None])[0]])
+            def get(self, url, headers=None): return _Resp(next(statuses))
+
+        rl = scraper.AdaptiveRateLimiter(initial_delay=0.0)
+        with patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
+            html = await scraper.fetch(_Session(), "https://x/browse/a", rl)
+        assert html == "<html>ok</html>"
+        assert rl.total_blocks == 1 and rl.blocked_until > 0
+
+    @pytest.mark.asyncio
+    async def test_fetch_gives_up_after_max_block_retries(self):
+        class _Resp:
+            status, headers = 403, {}
+            async def text(self): return "Just a moment..."
             async def __aenter__(self): return self
             async def __aexit__(self, *a): return False
 
-        config = {"sorting_methods": ["Relevance", "Rating", "Rating-Count", "Price-Asc"]}
-        with patch("tpt_scraper.aiohttp.ClientSession", return_value=_Session()), \
-             patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
-            kept = await scraper.check_sort_orders(config, [("", "elementary", "social-emotional", "", "", "")])
-        assert kept == ["Relevance", "Rating", "Price-Asc"]
+        class _Session:
+            calls = 0
+            def get(self, url, headers=None):
+                _Session.calls += 1
+                return _Resp()
 
-        # Single sort order: nothing to compare, returned unchanged without any requests
-        assert await scraper.check_sort_orders({"sorting_methods": ["Relevance"]}, [("", "", "", "", "", "")]) == ["Relevance"]
+        rl = scraper.AdaptiveRateLimiter(initial_delay=0.0)
+        with patch("tpt_scraper.asyncio.sleep", new_callable=AsyncMock):
+            html = await scraper.fetch(_Session(), "https://x/browse/a", rl, max_block_retries=3)
+        assert html is None
+        assert _Session.calls == 3          # one attempt per allowed cool-down, then gave up
+        assert rl.total_blocks >= 1 and rl.blocked_until > 0
 
 
 class TestScrapeMetadata:
